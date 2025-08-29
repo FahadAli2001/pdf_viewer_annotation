@@ -1,12 +1,12 @@
-// text embeded + data save on anotation 
+// text embeded + data save on anotation
 
-import 'dart:typed_data';
+// import 'dart:typed_data';
 import 'dart:developer';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:syncfusion_flutter_pdfviewer/pdfviewer.dart';
 import 'package:syncfusion_flutter_pdf/pdf.dart';
-import 'package:http/http.dart' as http;
+// import 'package:http/http.dart' as http;
 import 'package:flutter/foundation.dart';
 
 class MarkerParams {
@@ -58,7 +58,7 @@ class _PDFMarkerScreenState extends State<PDFMarkerScreen> {
   final PdfViewerController _pdfController = PdfViewerController();
   Uint8List _pdfBytes = Uint8List(0);
   double _currentZoom = 1.0;
-  int _markerCounter = 1;
+  
 
   // Future<void> _loadPdfFromNetwork() async {
   //   const url =
@@ -89,8 +89,23 @@ class _PDFMarkerScreenState extends State<PDFMarkerScreen> {
     final document = PdfDocument(inputBytes: params.bytes);
     final page = document.pages[params.page];
 
+    // 👇 Font define karo
+    final font = PdfStandardFont(
+      PdfFontFamily.helvetica,
+      25,
+      style: PdfFontStyle.bold,
+    );
+
+    // 👇 Text ka size measure karo
+    final textSize = font.measureString(params.label);
+
+    // 👇 Circle radius calculate: text width ya height ka aadha + thoda padding
+    final radius =
+        (textSize.width > textSize.height ? textSize.width : textSize.height) /
+            2 +
+        10; // padding for safe margin
+
     // Draw red circle
-    const radius = 30.0;
     page.graphics.drawEllipse(
       Rect.fromCircle(center: params.point, radius: radius),
       pen: PdfPen(PdfColor(255, 0, 0), width: 2),
@@ -99,9 +114,13 @@ class _PDFMarkerScreenState extends State<PDFMarkerScreen> {
 
     // Draw white bold text inside circle
     page.graphics.drawString(
-      params.label, // 👈 ab reg 1, reg 2 likhega
-      PdfStandardFont(PdfFontFamily.helvetica, 20, style: PdfFontStyle.bold),
-      bounds: Rect.fromCenter(center: params.point, width: 50, height: 50),
+      params.label,
+      font,
+      bounds: Rect.fromCenter(
+        center: params.point,
+        width: radius * 2,
+        height: radius * 2,
+      ),
       brush: PdfSolidBrush(PdfColor(255, 255, 255)),
       format: PdfStringFormat(
         alignment: PdfTextAlignment.center,
@@ -114,29 +133,82 @@ class _PDFMarkerScreenState extends State<PDFMarkerScreen> {
     return Uint8List.fromList(newBytes);
   }
 
-  
+  // static Uint8List processPdfWithMarker(MarkerParams params) {
+  //   final document = PdfDocument(inputBytes: params.bytes);
+  //   final page = document.pages[params.page];
+
+  //   // Draw red circle
+  //   const radius = 30.0;
+  //   page.graphics.drawEllipse(
+  //     Rect.fromCircle(center: params.point, radius: radius),
+  //     pen: PdfPen(PdfColor(255, 0, 0), width: 2),
+  //     brush: PdfSolidBrush(PdfColor(255, 0, 0)),
+  //   );
+
+  //   // Draw white bold text inside circle
+  //   page.graphics.drawString(
+  //     params.label, // 👈 ab reg 1, reg 2 likhega
+  //     PdfStandardFont(PdfFontFamily.helvetica, 20, style: PdfFontStyle.bold),
+  //     bounds: Rect.fromCenter(center: params.point, width: 50, height: 50),
+  //     brush: PdfSolidBrush(PdfColor(255, 255, 255)),
+  //     format: PdfStringFormat(
+  //       alignment: PdfTextAlignment.center,
+  //       lineAlignment: PdfVerticalAlignment.middle,
+  //     ),
+  //   );
+
+  //   final newBytes = document.saveSync();
+  //   document.dispose();
+  //   return Uint8List.fromList(newBytes);
+  // }
 
   Future<void> _addMarker(Offset pdfPoint, int pageNumber) async {
     if (_pdfBytes.isEmpty) return;
 
-    // 👇 user se note input
+    // 👇 Nearby markers detect karna
+    final nearbyMarkers = _markers.where((m) {
+      if ((m.page + 1) != pageNumber) return false;
+      final dx = (pdfPoint.dx - m.point.dx).abs();
+      final dy = (pdfPoint.dy - m.point.dy).abs();
+      return dx < 150 && dy < 150; // 👈 150px radius ke andar
+    }).toList();
+
+    // 👇 User se note input dialog
     final note = await showDialog<String>(
       context: context,
       builder: (context) {
         final controller = TextEditingController();
         return AlertDialog(
-          title: Text("Add Note for Marker"),
-          content: TextField(
-            controller: controller,
-            decoration: InputDecoration(hintText: "Enter your note..."),
+          title: const Text("Add Note for Marker"),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              if (nearbyMarkers.isNotEmpty) ...[
+                const Text("Nearby markers:"),
+                Wrap(
+                  spacing: 8,
+                  children: nearbyMarkers
+                      .map((m) => Chip(label: Text(m.label)))
+                      .toList(),
+                ),
+                const SizedBox(height: 12),
+              ],
+              TextField(
+                controller: controller,
+                decoration: const InputDecoration(
+                  hintText: "Enter your note...",
+                ),
+              ),
+            ],
           ),
           actions: [
             TextButton(
-              child: Text("Cancel"),
+              child: const Text("Cancel"),
               onPressed: () => Navigator.pop(context),
             ),
             TextButton(
-              child: Text("Save"),
+              child: const Text("Save"),
               onPressed: () => Navigator.pop(context, controller.text),
             ),
           ],
@@ -154,10 +226,10 @@ class _PDFMarkerScreenState extends State<PDFMarkerScreen> {
         _pdfBytes,
         pdfPoint,
         pageNumber - 1,
-        markerNumber, // 👈 int
-        markerLabel, // 👈 string label
+        markerNumber,
+        markerLabel,
         _currentZoom,
-        note: note, // baad me user note likh sake
+        note: note,
       );
 
       final Uint8List newBytes = await compute(processPdfWithMarker, params);
