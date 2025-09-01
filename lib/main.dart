@@ -1,1593 +1,2766 @@
-// text embeded + data save on anotation
-
-// import 'dart:typed_data';
 import 'dart:developer';
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
-import 'package:syncfusion_flutter_pdfviewer/pdfviewer.dart';
-import 'package:syncfusion_flutter_pdf/pdf.dart';
-// import 'package:http/http.dart' as http;
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
+import 'package:syncfusion_flutter_pdf/pdf.dart';
+import 'package:syncfusion_flutter_pdfviewer/pdfviewer.dart';
+
+/// -------------------------------
+/// MODELS
+/// -------------------------------
+class Marker {
+  final int page;
+  final Offset point;
+  final String label;
+  final String note;
+  final DateTime createdAt;
+
+  Marker(this.page, this.point, this.label, this.note, {DateTime? createdAt})
+    : createdAt = createdAt ?? DateTime.now();
+}
 
 class MarkerParams {
   final Uint8List bytes;
   final Offset point;
   final int page;
-  final int number; // marker ka asli int number
-  final String label; // 👈 reg 1, reg 2 etc.
-  final double zoom;
-  final String note; // 👈 extra note
+  final String label;
 
-  MarkerParams(
-    this.bytes,
-    this.point,
-    this.page,
-    this.number,
-    this.label,
-    this.zoom, {
-    this.note = "",
+  MarkerParams(this.bytes, this.point, this.page, this.label);
+}
+
+class LineParams {
+  final Uint8List bytes;
+  final int page;
+  final Offset startPoint;
+  final Offset endPoint;
+
+  LineParams({
+    required this.bytes,
+    required this.page,
+    required this.startPoint,
+    required this.endPoint,
   });
 }
 
-void main() {
-  runApp(const MyApp());
+/// -------------------------------
+/// PDF PROCESSING (OPTIMIZED)
+/// -------------------------------
+Uint8List processPdfWithMarker(MarkerParams params) {
+  final document = PdfDocument(inputBytes: params.bytes);
+  final page = document.pages[params.page];
+
+  final radius = 25.0;
+
+  // White background for better contrast
+  page.graphics.drawEllipse(
+    Rect.fromCircle(center: params.point, radius: radius + 2),
+    brush: PdfSolidBrush(PdfColor(255, 255, 255)),
+  );
+
+  // Red circle
+  page.graphics.drawEllipse(
+    Rect.fromCircle(center: params.point, radius: radius),
+    pen: PdfPen(PdfColor(200, 0, 0), width: 2),
+    brush: PdfSolidBrush(PdfColor(255, 0, 0)),
+  );
+
+  // Use a reliable font with proper size
+  final font = PdfStandardFont(
+    PdfFontFamily.helvetica,
+    20,
+    style: PdfFontStyle.bold,
+  );
+
+  // Calculate text bounds properly
+  final textBounds = Rect.fromLTWH(
+    params.point.dx - radius,
+    params.point.dy - radius,
+    radius * 2,
+    radius * 2,
+  );
+
+  // Draw the label text
+  page.graphics.drawString(
+    params.label,
+    font,
+    brush: PdfSolidBrush(PdfColor(255, 255, 255)),
+    bounds: textBounds,
+    format: PdfStringFormat(
+      alignment: PdfTextAlignment.center,
+      lineAlignment: PdfVerticalAlignment.middle,
+    ),
+  );
+
+  final newBytes = document.saveSync();
+  document.dispose();
+  return Uint8List.fromList(newBytes);
 }
 
-class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+Uint8List processPdfWithLine(LineParams params) {
+  final document = PdfDocument(inputBytes: params.bytes);
+  final page = document.pages[params.page];
+
+  final pen = PdfPen(PdfColor(255, 0, 0), width: 3);
+  page.graphics.drawLine(pen, params.startPoint, params.endPoint);
+
+  final newBytes = document.saveSync();
+  document.dispose();
+  return Uint8List.fromList(newBytes);
+}
+
+/// -------------------------------
+/// MAIN WIDGET (OPTIMIZED)
+/// -------------------------------
+class PdfMarkerExample extends StatefulWidget {
+  final Uint8List initialPdf;
+
+  const PdfMarkerExample({super.key, required this.initialPdf});
+
   @override
-  Widget build(BuildContext context) {
-    return MaterialApp(
-      debugShowCheckedModeBanner: false,
-      title: 'PDF Marker Demo',
-      theme: ThemeData(primarySwatch: Colors.blue),
-      home: const PDFMarkerScreen(),
-    );
-  }
+  State<PdfMarkerExample> createState() => _PdfMarkerExampleState();
 }
 
-class PDFMarkerScreen extends StatefulWidget {
-  const PDFMarkerScreen({super.key});
-  @override
-  State<PDFMarkerScreen> createState() => _PDFMarkerScreenState();
-}
+class _PdfMarkerExampleState extends State<PdfMarkerExample> {
+  late Uint8List _pdfBytes;
+  final List<Marker> _markers = [];
+  final Map<String, Uint8List> _pdfCache = {};
 
-class _PDFMarkerScreenState extends State<PDFMarkerScreen> {
-  List<MarkerParams> _markers = []; // sab markers yahan store honge
-
+  bool _lineMode = false;
+  Offset? _firstTap;
   final PdfViewerController _pdfController = PdfViewerController();
-  Uint8List _pdfBytes = Uint8List(0);
-  double _currentZoom = 1.0;
-  
-
-  // Future<void> _loadPdfFromNetwork() async {
-  //   const url =
-  //       "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf";
-  //   final response = await http.get(Uri.parse(url));
-  //   if (response.statusCode == 200) {
-  //     setState(() => _pdfBytes = response.bodyBytes);
-  //   } else {
-  //     throw Exception("PDF load failed");
-  //   }
-  // }
-
-  Future<void> _loadLocalPdf() async {
-    final bytes = await rootBundle.load('assets/PDF.pdf');
-    setState(() {
-      _pdfBytes = bytes.buffer.asUint8List();
-    });
-  }
+  final ValueNotifier<bool> _isProcessing = ValueNotifier(false);
 
   @override
   void initState() {
     super.initState();
-    // _loadPdfFromNetwork();
-    _loadLocalPdf();
+    _pdfBytes = widget.initialPdf;
+    _pdfCache['original'] = widget.initialPdf;
   }
 
-  static Uint8List processPdfWithMarker(MarkerParams params) {
-    final document = PdfDocument(inputBytes: params.bytes);
-    final page = document.pages[params.page];
+  /// Find nearby markers within 100px radius
+  List<Marker> _findNearbyMarkers(Offset point, int pageNumber) {
+    return _markers.where((marker) {
+      if (marker.page != pageNumber - 1) return false;
 
-    // 👇 Font define karo
-    final font = PdfStandardFont(
-      PdfFontFamily.helvetica,
-      25,
-      style: PdfFontStyle.bold,
-    );
-
-    // 👇 Text ka size measure karo
-    final textSize = font.measureString(params.label);
-
-    // 👇 Circle radius calculate: text width ya height ka aadha + thoda padding
-    final radius =
-        (textSize.width > textSize.height ? textSize.width : textSize.height) /
-            2 +
-        10; // padding for safe margin
-
-    // Draw red circle
-    page.graphics.drawEllipse(
-      Rect.fromCircle(center: params.point, radius: radius),
-      pen: PdfPen(PdfColor(255, 0, 0), width: 2),
-      brush: PdfSolidBrush(PdfColor(255, 0, 0)),
-    );
-
-    // Draw white bold text inside circle
-    page.graphics.drawString(
-      params.label,
-      font,
-      bounds: Rect.fromCenter(
-        center: params.point,
-        width: radius * 2,
-        height: radius * 2,
-      ),
-      brush: PdfSolidBrush(PdfColor(255, 255, 255)),
-      format: PdfStringFormat(
-        alignment: PdfTextAlignment.center,
-        lineAlignment: PdfVerticalAlignment.middle,
-      ),
-    );
-
-    final newBytes = document.saveSync();
-    document.dispose();
-    return Uint8List.fromList(newBytes);
-  }
-
-  // static Uint8List processPdfWithMarker(MarkerParams params) {
-  //   final document = PdfDocument(inputBytes: params.bytes);
-  //   final page = document.pages[params.page];
-
-  //   // Draw red circle
-  //   const radius = 30.0;
-  //   page.graphics.drawEllipse(
-  //     Rect.fromCircle(center: params.point, radius: radius),
-  //     pen: PdfPen(PdfColor(255, 0, 0), width: 2),
-  //     brush: PdfSolidBrush(PdfColor(255, 0, 0)),
-  //   );
-
-  //   // Draw white bold text inside circle
-  //   page.graphics.drawString(
-  //     params.label, // 👈 ab reg 1, reg 2 likhega
-  //     PdfStandardFont(PdfFontFamily.helvetica, 20, style: PdfFontStyle.bold),
-  //     bounds: Rect.fromCenter(center: params.point, width: 50, height: 50),
-  //     brush: PdfSolidBrush(PdfColor(255, 255, 255)),
-  //     format: PdfStringFormat(
-  //       alignment: PdfTextAlignment.center,
-  //       lineAlignment: PdfVerticalAlignment.middle,
-  //     ),
-  //   );
-
-  //   final newBytes = document.saveSync();
-  //   document.dispose();
-  //   return Uint8List.fromList(newBytes);
-  // }
-
-  Future<void> _addMarker(Offset pdfPoint, int pageNumber) async {
-    if (_pdfBytes.isEmpty) return;
-
-    // 👇 Nearby markers detect karna
-    final nearbyMarkers = _markers.where((m) {
-      if ((m.page + 1) != pageNumber) return false;
-      final dx = (pdfPoint.dx - m.point.dx).abs();
-      final dy = (pdfPoint.dy - m.point.dy).abs();
-      return dx < 150 && dy < 150; // 👈 150px radius ke andar
+      final distance = (point - marker.point).distance;
+      return distance <= 100.0;
     }).toList();
+  }
 
-    // 👇 User se note input dialog
-    final note = await showDialog<String>(
+  /// Optimized marker addition with caching
+  Future<void> _addMarker(Offset pdfPoint, int pageNumber) async {
+    if (_isProcessing.value) return;
+
+    _isProcessing.value = true;
+
+    try {
+      // FIXED: Use simple label format that will definitely work
+      final label = "reg ${_markers.length + 1}"; // Just the number
+      final cacheKey = 'marker_${_markers.length}';
+
+      // Find nearby markers before showing dialog
+      final nearbyMarkers = _findNearbyMarkers(pdfPoint, pageNumber);
+
+      // Show note dialog with nearby markers info
+      final noteText = await _showNoteDialog(
+        "Marker ${_markers.length + 1}",
+        nearbyMarkers,
+      );
+      if (noteText == null || noteText.isEmpty) {
+        _isProcessing.value = false;
+        return;
+      }
+
+      // Use compute for heavy processing
+      final Uint8List newBytes = await compute(
+        processPdfWithMarker,
+        MarkerParams(_pdfBytes, pdfPoint, pageNumber - 1, label),
+      );
+
+      // Update cache and state
+      _pdfCache[cacheKey] = newBytes;
+
+      setState(() {
+        _pdfBytes = newBytes;
+        _markers.add(
+          Marker(
+            pageNumber - 1,
+            pdfPoint,
+            "Marker ${_markers.length + 1}",
+            noteText,
+          ),
+        );
+      });
+    } catch (e) {
+      log('Error adding marker: $e');
+    } finally {
+      _isProcessing.value = false;
+    }
+  }
+
+  /// Optimized line drawing
+  Future<void> _addLine(Offset pdfPoint, int pageNumber) async {
+    if (_isProcessing.value) return;
+
+    if (_firstTap == null) {
+      setState(() => _firstTap = pdfPoint);
+      return;
+    }
+
+    _isProcessing.value = true;
+
+    try {
+      final params = LineParams(
+        bytes: _pdfBytes,
+        page: pageNumber - 1,
+        startPoint: _firstTap!,
+        endPoint: pdfPoint,
+      );
+
+      final newBytes = await compute(processPdfWithLine, params);
+
+      setState(() {
+        _pdfBytes = newBytes;
+        _firstTap = null;
+        _pdfCache['line_${_markers.length}'] = newBytes;
+      });
+    } catch (e) {
+      log('Error adding line: $e');
+    } finally {
+      _isProcessing.value = false;
+    }
+  }
+
+  /// Note dialog with nearby markers display
+  Future<String?> _showNoteDialog(
+    String label,
+    List<Marker> nearbyMarkers,
+  ) async {
+    final controller = TextEditingController();
+
+    return showDialog<String>(
       context: context,
-      builder: (context) {
-        final controller = TextEditingController();
-        return AlertDialog(
-          title: const Text("Add Note for Marker"),
-          content: Column(
+      barrierDismissible: false,
+      builder: (_) => AlertDialog(
+        title: Text("Note for $label"),
+        content: SingleChildScrollView(
+          child: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               if (nearbyMarkers.isNotEmpty) ...[
-                const Text("Nearby markers:"),
-                Wrap(
-                  spacing: 8,
-                  children: nearbyMarkers
-                      .map((m) => Chip(label: Text(m.label)))
-                      .toList(),
+                const Text(
+                  "Nearby Markers:",
+                  style: TextStyle(fontWeight: FontWeight.bold),
                 ),
-                const SizedBox(height: 12),
+                const SizedBox(height: 8),
+                ...nearbyMarkers
+                    .map(
+                      (marker) => Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 4.0),
+                        child: Row(
+                          children: [
+                            Container(
+                              width: 12,
+                              height: 12,
+                              decoration: BoxDecoration(
+                                color: Colors.red,
+                                borderRadius: BorderRadius.circular(6),
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    marker.label,
+                                    style: const TextStyle(
+                                      fontWeight: FontWeight.w500,
+                                    ),
+                                  ),
+                                  Text(
+                                    marker.note,
+                                    style: const TextStyle(
+                                      fontSize: 12,
+                                      color: Colors.grey,
+                                    ),
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    )
+                    .toList(),
+                const SizedBox(height: 16),
+                const Divider(),
+                const SizedBox(height: 8),
               ],
+
               TextField(
                 controller: controller,
                 decoration: const InputDecoration(
-                  hintText: "Enter your note...",
+                  hintText: "Enter description...",
+                  border: OutlineInputBorder(),
+                  labelText: "Marker Note",
                 ),
+                maxLines: 3,
+                autofocus: true,
               ),
             ],
           ),
-          actions: [
-            TextButton(
-              child: const Text("Cancel"),
-              onPressed: () => Navigator.pop(context),
-            ),
-            TextButton(
-              child: const Text("Save"),
-              onPressed: () => Navigator.pop(context, controller.text),
-            ),
-          ],
-        );
-      },
-    );
-
-    if (note == null || note.isEmpty) return;
-
-    try {
-      final markerNumber = _markers.length + 1;
-      final markerLabel = "reg $markerNumber";
-
-      final params = MarkerParams(
-        _pdfBytes,
-        pdfPoint,
-        pageNumber - 1,
-        markerNumber,
-        markerLabel,
-        _currentZoom,
-        note: note,
-      );
-
-      final Uint8List newBytes = await compute(processPdfWithMarker, params);
-
-      setState(() {
-        _pdfBytes = newBytes;
-        _markers.add(params);
-      });
-    } catch (e) {
-      log('Error adding marker: $e');
-    }
-  }
-
-  void _showMarkerData(MarkerParams marker) {
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: Text("Marker ${marker.number}"),
-        content: Text(marker.note),
+        ),
         actions: [
           TextButton(
-            child: Text("Close"),
             onPressed: () => Navigator.pop(context),
+            child: const Text("Cancel"),
           ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, controller.text),
+            child: const Text("Save"),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Show marker info with animation
+  void _showMarkerInfo(Marker marker) {
+    showModalBottomSheet(
+      context: context,
+      builder: (_) => Container(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              marker.label,
+              style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 8),
+            Text(marker.note),
+            const SizedBox(height: 8),
+            Text(
+              "Added: ${marker.createdAt.toString().split('.').first}",
+              style: const TextStyle(color: Colors.grey, fontSize: 12),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Clear all markers and reset to original
+  void _clearAllMarkers() {
+    setState(() {
+      _pdfBytes = widget.initialPdf;
+      _markers.clear();
+      _pdfCache.clear();
+      _pdfCache['original'] = widget.initialPdf;
+      _firstTap = null;
+    });
+  }
+
+  /// -------------------------------
+  /// OPTIMIZED BUILD METHOD
+  /// -------------------------------
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text("PDF Marker"),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.refresh),
+            onPressed: _clearAllMarkers,
+            tooltip: "Clear All",
+          ),
+          ValueListenableBuilder<bool>(
+            valueListenable: _isProcessing,
+            builder: (context, isProcessing, child) {
+              return isProcessing
+                  ? const Padding(
+                      padding: EdgeInsets.all(8.0),
+                      child: SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      ),
+                    )
+                  : const SizedBox();
+            },
+          ),
+        ],
+      ),
+
+      body: Stack(
+        children: [
+          SfPdfViewer.memory(
+            _pdfBytes,
+            controller: _pdfController,
+            canShowScrollHead: false,
+            canShowScrollStatus: false,
+            pageLayoutMode: PdfPageLayoutMode.single,
+            onTap: (details) async {
+              if (_isProcessing.value) return;
+
+              final tappedPoint = details.pagePosition;
+              for (final marker in _markers) {
+                if (marker.page == details.pageNumber - 1) {
+                  final distance = (tappedPoint - marker.point).distance;
+                  if (distance < 25) {
+                    _showMarkerInfo(marker);
+                    return;
+                  }
+                }
+              }
+
+              if (_lineMode) {
+                await _addLine(details.pagePosition, details.pageNumber);
+              } else {
+                await _addMarker(details.pagePosition, details.pageNumber);
+              }
+            },
+          ),
+
+          if (_lineMode && _firstTap != null)
+            Positioned(
+              left: _firstTap!.dx - 10,
+              top: _firstTap!.dy - 10,
+              child: Container(
+                width: 20,
+                height: 20,
+                decoration: const BoxDecoration(
+                  color: Colors.red,
+                  shape: BoxShape.circle,
+                ),
+              ),
+            ),
+
+          Positioned(
+            right: 16,
+            bottom: 100,
+            child: Column(
+              children: [
+                FloatingActionButton(
+                  heroTag: "zoomIn",
+                  mini: true,
+                  onPressed: () {
+                    _pdfController.zoomLevel += 0.5;
+                  },
+                  child: const Icon(Icons.zoom_in),
+                ),
+                const SizedBox(height: 10),
+                FloatingActionButton(
+                  heroTag: "zoomOut",
+                  mini: true,
+                  onPressed: () {
+                    if (_pdfController.zoomLevel > 1) {
+                      _pdfController.zoomLevel -= 0.5;
+                    }
+                  },
+                  child: const Icon(Icons.zoom_out),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+
+      floatingActionButton: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          FloatingActionButton(
+            heroTag: "modeToggle",
+            onPressed: () {
+              setState(() {
+                _lineMode = !_lineMode;
+                _firstTap = null;
+              });
+            },
+            child: Icon(_lineMode ? Icons.linear_scale : Icons.edit),
+          ),
+          const SizedBox(height: 10),
+          if (_markers.isNotEmpty)
+            FloatingActionButton(
+              heroTag: "markersCount",
+              mini: true,
+              onPressed: () {
+                showDialog(
+                  context: context,
+                  builder: (_) => AlertDialog(
+                    title: const Text("All Markers"),
+                    content: SizedBox(
+                      width: double.maxFinite,
+                      child: ListView.builder(
+                        shrinkWrap: true,
+                        itemCount: _markers.length,
+                        itemBuilder: (_, index) => ListTile(
+                          leading: Container(
+                            width: 12,
+                            height: 12,
+                            decoration: BoxDecoration(
+                              color: Colors.red,
+                              borderRadius: BorderRadius.circular(6),
+                            ),
+                          ),
+                          title: Text(_markers[index].label),
+                          subtitle: Text(
+                            _markers[index].note,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                          onTap: () => _showMarkerInfo(_markers[index]),
+                        ),
+                      ),
+                    ),
+                  ),
+                );
+              },
+              child: Text('${_markers.length}'),
+            ),
         ],
       ),
     );
   }
 
   @override
+  void dispose() {
+    _isProcessing.dispose();
+    super.dispose();
+  }
+}
+
+/// -------------------------------
+/// MAIN APP
+/// -------------------------------
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  // Load sample PDF
+  final ByteData data = await rootBundle.load('assets/PDF.pdf');
+  final Uint8List pdfBytes = data.buffer.asUint8List();
+
+  runApp(MyApp(initialPdf: pdfBytes));
+}
+
+class MyApp extends StatelessWidget {
+  final Uint8List initialPdf;
+  const MyApp({super.key, required this.initialPdf});
+
+  @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text("PDF Marker with Zoom"),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.list),
-            onPressed: () {
-              for (var m in _markers) {
-                log(
-                  "Marker ${m.number} -> Page: ${m.page + 1}, X: ${m.point.dx}, Y: ${m.point.dy}",
-                );
-              }
-            },
-          ),
-        ],
-      ),
-      body: SfPdfViewer.memory(
-        _pdfBytes,
-        controller: _pdfController,
-        onZoomLevelChanged: (PdfZoomDetails details) {
-          setState(() => _currentZoom = details.newZoomLevel);
-          log("deatils zoom ${details.newZoomLevel}");
-        },
-        // onTap: (PdfGestureDetails details) {
-        //   _addMarker(details.pagePosition, details.pageNumber);
-        // },
-        onTap: (PdfGestureDetails details) {
-          final tappedPoint = details.pagePosition;
-
-          // 👇 check marker hit
-          for (var m in _markers) {
-            if ((m.page + 1) == details.pageNumber) {
-              final dx = (tappedPoint.dx - m.point.dx).abs();
-              final dy = (tappedPoint.dy - m.point.dy).abs();
-              if (dx < 20 && dy < 20) {
-                // circle radius check
-                _showMarkerData(m);
-                return;
-              }
-            }
-          }
-
-          // warna naya marker banega
-          _addMarker(details.pagePosition, details.pageNumber);
-        },
-      ),
-      floatingActionButton: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          FloatingActionButton(
-            mini: true,
-            child: const Icon(Icons.add),
-            onPressed: () {
-              setState(() {
-                _pdfController.zoomLevel += 0.5;
-                _currentZoom = _pdfController.zoomLevel;
-              });
-              log(_currentZoom.toString());
-            },
-          ),
-          const SizedBox(height: 8),
-          FloatingActionButton(
-            mini: true,
-            child: const Icon(Icons.remove),
-            onPressed: () {
-              setState(() {
-                _pdfController.zoomLevel -= 0.5;
-                _currentZoom = _pdfController.zoomLevel;
-              });
-            },
-          ),
-        ],
-      ),
+    return MaterialApp(
+      title: 'PDF Marker',
+      theme: ThemeData(primarySwatch: Colors.blue, useMaterial3: true),
+      debugShowCheckedModeBanner: false,
+      home: PdfMarkerExample(initialPdf: initialPdf),
     );
   }
 }
 
 
 
-// // // ------------ paint style---------------
-
+// // ------ main code -----
+// import 'dart:developer';
 // import 'dart:typed_data';
-// import 'dart:math' as math;
 // import 'package:flutter/material.dart';
-// import 'package:flutter/services.dart' show rootBundle;
-// import 'package:pdfx/pdfx.dart';
-// import 'package:syncfusion_flutter_pdf/pdf.dart' as sf;
-// import 'package:vector_math/vector_math_64.dart' show Vector3;
+// import 'package:flutter/foundation.dart';
+// import 'package:flutter/services.dart';
+// import 'package:syncfusion_flutter_pdf/pdf.dart';
+// import 'package:syncfusion_flutter_pdfviewer/pdfviewer.dart';
 
-// /// ---------- Models
+// /// -------------------------------
+// /// MODELS
+// /// -------------------------------
 
-// class MarkerPoint {
-//   final int page; // 1-based page index
-//   final double x; // page-space X (pixels of the rendered page image)
-//   final double y; // page-space Y
-//   MarkerPoint({required this.page, required this.x, required this.y});
+// /// Marker model
+// class Marker {
+//   final int page; // jis page pe marker draw hua
+//   final Offset point; // marker ka position
+//   final String label; // e.g. "Reg 1"
+//   final String note; // user entered note
+
+//   Marker(this.page, this.point, this.label, this.note);
 // }
 
-// class Cluster {
-//   final Offset centerScreen; // screen-space position (after transform)
-//   final List<MarkerPoint> members;
-//   Cluster({required this.centerScreen, required this.members});
+// /// Marker embedding params
+// class MarkerParams {
+//   final Uint8List bytes;
+//   final Offset point;
+//   final int page;
+//   final String label;
+
+//   MarkerParams(this.bytes, this.point, this.page, this.label);
 // }
 
-// /// ---------- App
+// /// Line embedding params
+// class LineParams {
+//   final Uint8List bytes;
+//   final int page;
+//   final Offset startPoint;
+//   final Offset endPoint;
 
-// void main() => runApp(
-//   const MaterialApp(debugShowCheckedModeBanner: false, home: PdfClusterDemo()),
-// );
+//   LineParams({
+//     required this.bytes,
+//     required this.page,
+//     required this.startPoint,
+//     required this.endPoint,
+//   });
+// }
 
-// class PdfClusterDemo extends StatefulWidget {
-//   const PdfClusterDemo({super.key});
+// /// -------------------------------
+// /// PDF DRAW METHODS
+// /// -------------------------------
+
+// /// Embed marker (circle + label text) into PDF
+// Uint8List processPdfWithMarker(MarkerParams params) {
+//   final document = PdfDocument(inputBytes: params.bytes);
+//   final page = document.pages[params.page];
+
+//   // Dynamic radius based on label length
+//   final radius = 15.0 + (params.label.length * 6);
+
+//   // Draw circle
+//   page.graphics.drawEllipse(
+//     Rect.fromCircle(center: params.point, radius: radius),
+//     pen: PdfPen(PdfColor(255, 0, 0), width: 2), // red border
+//     brush: PdfSolidBrush(PdfColor(255, 0, 0)), // red fill
+//   );
+
+//   // Draw label text inside circle
+//   page.graphics.drawString(
+//     params.label,
+//     PdfStandardFont(PdfFontFamily.helvetica, 22, style: PdfFontStyle.bold),
+//     bounds: Rect.fromCenter(
+//       center: params.point,
+//       width: radius * 2,
+//       height: radius * 2,
+//     ),
+//     brush: PdfSolidBrush(PdfColor(255, 255, 255)), // white text
+//     format: PdfStringFormat(
+//       alignment: PdfTextAlignment.center,
+//       lineAlignment: PdfVerticalAlignment.middle,
+//     ),
+//   );
+
+//   final newBytes = document.saveSync();
+//   document.dispose();
+//   return Uint8List.fromList(newBytes);
+// }
+
+// /// Embed line into PDF
+// Uint8List processPdfWithLine(LineParams params) {
+//   final document = PdfDocument(inputBytes: params.bytes);
+//   final page = document.pages[params.page];
+
+//   final pen = PdfPen(PdfColor(255, 0, 0), width: 4); // red line
+//   page.graphics.drawLine(pen, params.startPoint, params.endPoint);
+
+//   final newBytes = document.saveSync();
+//   document.dispose();
+//   return Uint8List.fromList(newBytes);
+// }
+
+// /// -------------------------------
+// /// MAIN WIDGET
+// /// -------------------------------
+
+// class PdfMarkerExample extends StatefulWidget {
+//   final Uint8List initialPdf;
+
+//   const PdfMarkerExample({super.key, required this.initialPdf});
+
 //   @override
-//   State<PdfClusterDemo> createState() => _PdfClusterDemoState();
+//   State<PdfMarkerExample> createState() => _PdfMarkerExampleState();
 // }
 
-// class _PdfClusterDemoState extends State<PdfClusterDemo> {
-//   late Future<_DocBundle> _bundleFut;
+// class _PdfMarkerExampleState extends State<PdfMarkerExample> {
+//   late Uint8List _pdfBytes;
+//   final List<Marker> _markers = [];
 
-//   // store markers across pages; here demo uses only page 1
-//   final List<MarkerPoint> _markers = [];
-
-//   // PDF bytes to export annotations later
-//   Uint8List _pdfBytes = Uint8List(0);
+//   bool _lineMode = false; // toggle for line/marker mode
+//   Offset? _firstTap; // store first tap for line
+//   final PdfViewerController _pdfController = PdfViewerController();
 
 //   @override
 //   void initState() {
 //     super.initState();
-//     _bundleFut = _load();
+//     _pdfBytes = widget.initialPdf;
 //   }
 
-//   Future<_DocBundle> _load() async {
-//     // Load from assets (use your own source if needed)
-//     final bytes = await rootBundle.load('assets/PDF.pdf');
-//     _pdfBytes = bytes.buffer.asUint8List();
+//   /// Add marker on tap
+//   Future<void> _addMarker(Offset pdfPoint, int pageNumber) async {
+//     final label = "Reg ${_markers.length + 1}";
 
-//     // Open with pdfx for raster rendering info
-//     final doc = await PdfDocument.openData(_pdfBytes);
+//     // Nearby markers detect karna
+//     final nearbyMarkers = _markers.where((m) {
+//       if (m.page != pageNumber - 1) return false;
+//       final dx = (pdfPoint.dx - m.point.dx).abs();
+//       final dy = (pdfPoint.dy - m.point.dy).abs();
+//       return dx < 50 && dy < 50;
+//     }).toList();
 
-//     // We'll just show page 1 in this minimal demo
-//     final page = await doc.getPage(1);
+//     String? noteText = await _showNoteDialog(label, nearbyMarkers);
 
-//     // render page as image just to get its dimensions
-//     final pageImage = await page.render(
-//       width: page.width,
-//       height: page.height,
-//       format: PdfPageImageFormat.png,
+//     if (noteText == null || noteText.isEmpty) return;
+
+//     final Uint8List newBytes = await compute(
+//       processPdfWithMarker,
+//       MarkerParams(_pdfBytes, pdfPoint, pageNumber - 1, label),
 //     );
 
-//     await page.close();
-
-//     return _DocBundle(
-//       pdfBytes: _pdfBytes,
-
-//       firstPageSize: Size(
-//         pageImage!.width!.toDouble(),
-//         pageImage.height!.toDouble(),
-//       ),
-//       doc: doc,
-//     );
+//     setState(() {
+//       _pdfBytes = newBytes;
+//       _markers.add(Marker(pageNumber - 1, pdfPoint, label, noteText));
+//     });
 //   }
 
-//   Future<void> _exportWithAnnotations() async {
-//     if (_pdfBytes.isEmpty) return;
-//     final pdf = sf.PdfDocument(inputBytes: _pdfBytes);
-
-//     for (final m in _markers) {
-//       if (m.page < 1 || m.page > pdf.pages.count) continue;
-//       final page = pdf.pages[m.page - 1];
-
-//       // We saved marker coords in "rendered image pixels".
-//       // Syncfusion page's size is in PDF units (points; 72 dpi).
-//       // For simplicity we assume 1 image pixel == 1 PDF unit because pdfx default page size comes from 72 dpi.
-//       // If you render at another scale, multiply by (pdfWidth/renderedWidth, pdfHeight/renderedHeight).
-//       final r = 10.0;
-//       page.graphics.drawEllipse(
-//         Rect.fromCircle(center: Offset(m.x, m.y), radius: r),
-//         brush: sf.PdfSolidBrush(sf.PdfColor(220, 0, 0)),
-//         pen: sf.PdfPen(sf.PdfColor(255, 255, 255), width: 2),
+//   /// Add line on tap (two taps required)
+//   Future<void> _addLine(Offset pdfPoint, int pageNumber) async {
+//     if (_firstTap == null) {
+//       // first tap → set starting point
+//       setState(() {
+//         _firstTap = pdfPoint;
+//       });
+//     } else {
+//       // second tap → draw line
+//       final params = LineParams(
+//         bytes: _pdfBytes,
+//         page: pageNumber - 1,
+//         startPoint: _firstTap!,
+//         endPoint: pdfPoint,
 //       );
-//     }
 
-//     final out = pdf.saveSync();
-//     pdf.dispose();
+//       final newBytes = await compute(processPdfWithLine, params);
 
-//     // TODO: write `out` to a file via path_provider. For demo we just show a SnackBar.
-//     if (mounted) {
-//       ScaffoldMessenger.of(context).showSnackBar(
-//         const SnackBar(
-//           content: Text('PDF exported with annotations (bytes ready).'),
-//         ),
-//       );
+//       setState(() {
+//         _pdfBytes = newBytes;
+//         _firstTap = null; // reset
+//       });
 //     }
 //   }
 
-//   @override
-//   Widget build(BuildContext context) {
-//     return FutureBuilder<_DocBundle>(
-//       future: _bundleFut,
-//       builder: (context, snap) {
-//         final b = snap.data!;
-//         if (!snap.hasData) {
-//           return const Scaffold(
-//             body: Center(child: CircularProgressIndicator()),
-//           );
-//         }
-//         return Scaffold(
-//           appBar: AppBar(
-//             title: const Text('PDF Clustering Overlay'),
-//             actions: [
-//               TextButton.icon(
-//                 onPressed: _markers.isEmpty ? null : _exportWithAnnotations,
-//                 icon: const Icon(Icons.save, color: Colors.white),
-//                 label: const Text(
-//                   'Export',
-//                   style: TextStyle(color: Colors.blue),
-//                 ),
+//   /// Show dialog to enter marker note
+//   Future<String?> _showNoteDialog(String label, List<Marker> nearby) async {
+//     final controller = TextEditingController();
+
+//     return showDialog<String>(
+//       context: context,
+//       builder: (_) => AlertDialog(
+//         title: Text("Add note for $label"),
+//         content: Column(
+//           mainAxisSize: MainAxisSize.min,
+//           children: [
+//             if (nearby.isNotEmpty) ...[
+//               const Text("Nearby markers:"),
+//               Wrap(
+//                 spacing: 6,
+//                 children: nearby
+//                     .map((m) => Chip(label: Text(m.label)))
+//                     .toList(),
 //               ),
+//               const SizedBox(height: 8),
 //             ],
+//             TextField(
+//               controller: controller,
+//               decoration: const InputDecoration(labelText: "Enter note"),
+//             ),
+//           ],
+//         ),
+//         actions: [
+//           TextButton(
+//             child: const Text("Cancel"),
+//             onPressed: () => Navigator.pop(context),
 //           ),
-//           body: PdfClusterPage(
-//             pdfDoc: b.doc,
-//             pageNumber: 1,
-//             pageSize: b.firstPageSize,
-//             markers: _markers,
-//             onAddMarker: (m) => setState(() => _markers.add(m)),
+//           TextButton(
+//             child: const Text("Save"),
+//             onPressed: () => Navigator.pop(context, controller.text),
 //           ),
-//           floatingActionButton: FloatingActionButton.extended(
-//             onPressed: () => setState(() => _markers.clear()),
-//             label: const Text('Clear markers'),
-//             icon: const Icon(Icons.clear),
-//           ),
-//         );
-//       },
+//         ],
+//       ),
 //     );
 //   }
-// }
 
-// class _DocBundle {
-//   final Uint8List pdfBytes;
-//   final PdfDocument doc;
-//   final Size firstPageSize;
-
-//   _DocBundle({
-//     required this.pdfBytes,
-//     required this.doc,
-//     required this.firstPageSize,
-//   });
-// }
-
-// /// ---------- The core widget (one page)
-
-// class PdfClusterPage extends StatefulWidget {
-//   final PdfDocument pdfDoc;
-//   final int pageNumber;
-//   final Size pageSize; // pixels of rastered page at 72 dpi
-//   final List<MarkerPoint> markers;
-//   final ValueChanged<MarkerPoint> onAddMarker;
-
-//   const PdfClusterPage({
-//     super.key,
-//     required this.pdfDoc,
-//     required this.pageNumber,
-//     required this.pageSize,
-//     required this.markers,
-//     required this.onAddMarker,
-//   });
-
-//   @override
-//   State<PdfClusterPage> createState() => _PdfClusterPageState();
-// }
-
-// class _PdfClusterPageState extends State<PdfClusterPage> {
-//   final _controller = TransformationController();
-//   final _repaintKey = GlobalKey();
-
-//   double get _scale => _controller.value.getMaxScaleOnAxis();
-
-//   /// Convert a global/local position (on the viewer) to page-space coordinates
-//   Offset _toPageSpace(Offset local) {
-//     final inv = Matrix4.inverted(_controller.value);
-//     final vec3 = inv.transform3(Vector3(local.dx, local.dy, 0));
-//     return Offset(vec3.x, vec3.y);
+//   /// Show marker details on tap
+//   void _showMarkerData(Marker marker) {
+//     showDialog(
+//       context: context,
+//       builder: (_) => AlertDialog(
+//         title: Text(marker.label),
+//         content: Text(marker.note),
+//         actions: [
+//           TextButton(
+//             child: const Text("Close"),
+//             onPressed: () => Navigator.pop(context),
+//           ),
+//         ],
+//       ),
+//     );
 //   }
 
-//   /// Convert a page-space position to current screen-space (after transform)
-//   Offset _toScreenSpace(Offset pagePos) {
-//     final v = _controller.value.transform3(Vector3(pagePos.dx, pagePos.dy, 0));
-//     return Offset(v.x, v.y);
-//   }
-
-//   List<Cluster> _computeClusters(Size screenSize) {
-//     // project each marker to screen space
-//     final pts = <Offset>[];
-//     final list = <MarkerPoint>[];
-
-//     for (final m in widget.markers.where(
-//       (mm) => mm.page == widget.pageNumber,
-//     )) {
-//       final ss = _toScreenSpace(Offset(m.x, m.y));
-//       pts.add(ss);
-//       list.add(m);
-//     }
-
-//     final clusters = <Cluster>[];
-//     const baseThreshold = 60.0; // px (screen) — tweak as you like
-//     final threshold = baseThreshold; // already in screen space, no scale needed
-
-//     final used = List<bool>.filled(pts.length, false);
-//     for (int i = 0; i < pts.length; i++) {
-//       if (used[i]) continue;
-//       final groupIdx = <int>[i];
-//       for (int j = i + 1; j < pts.length; j++) {
-//         if (used[j]) continue;
-//         if ((pts[i] - pts[j]).distance <= threshold) {
-//           groupIdx.add(j);
-//         }
-//       }
-//       for (final gi in groupIdx) {
-//         used[gi] = true;
-//       }
-//       // center = avg screen position
-//       final cx =
-//           groupIdx.map((k) => pts[k].dx).reduce((a, b) => a + b) /
-//           groupIdx.length;
-//       final cy =
-//           groupIdx.map((k) => pts[k].dy).reduce((a, b) => a + b) /
-//           groupIdx.length;
-//       clusters.add(
-//         Cluster(
-//           centerScreen: Offset(cx, cy),
-//           members: groupIdx.map((k) => list[k]).toList(),
-//         ),
-//       );
-//     }
-
-//     return clusters;
-//   }
-
+//   /// -------------------------------
+//   /// BUILD UI
+//   /// -------------------------------
 //   @override
 //   Widget build(BuildContext context) {
-//     final pageSize = widget.pageSize;
+//     return Scaffold(
+//       appBar: AppBar(title: const Text("PDF Marker & Line Example")),
+//       body: Stack(
+//         children: [
+//           // PDF Viewer
+//           SfPdfViewer.memory(
+//             maxZoomLevel: 8,
+//             _pdfBytes,
+//             controller: _pdfController,
+//             onTap: (details) {
+//               if (_lineMode) {
+//                 _addLine(details.pagePosition, details.pageNumber);
+//                 return;
+//               }
 
-//     return LayoutBuilder(
-//       builder: (context, constraints) {
-//         // Center the page in the available space
-//         final pageWidget = FutureBuilder<PdfPageImage>(
-//           future: widget.pdfDoc.getPage(widget.pageNumber).then((page) async {
-//             final img = await page.render(
-//               width: widget.pageSize.width,
-//               height: widget.pageSize.height,
-//             );
-//             await page.close();
+//               // check if tapped on existing marker
+//               final tappedPoint = details.pagePosition;
+//               for (var m in _markers) {
+//                 if ((m.page + 1) == details.pageNumber) {
+//                   final dx = (tappedPoint.dx - m.point.dx).abs();
+//                   final dy = (tappedPoint.dy - m.point.dy).abs();
+//                   if (dx < 20 && dy < 20) {
+//                     _showMarkerData(m);
+//                     return;
+//                   }
+//                 }
+//               }
 
-//             if (img == null) {
-//               throw Exception("Failed to render PDF page");
-//             }
+//               // otherwise add new marker
+//               _addMarker(details.pagePosition, details.pageNumber);
+//             },
+//           ),
 
-//             return img; // now it's PdfPageImage (non-null)
-//           }),
-
-//           builder: (context, snapshot) {
-//             if (!snapshot.hasData) {
-//               return const Center(child: CircularProgressIndicator());
-//             }
-//             return SizedBox(
-//               width: pageSize.width,
-//               height: pageSize.height,
-//               child: Image.memory(snapshot.data!.bytes, fit: BoxFit.contain),
-//             );
-//           },
-//         );
-//         final clusters = _computeClusters(constraints.biggest);
-//         return GestureDetector(
-//           onTapUp: (d) {
-//             // local (within the stack)
-//             final local = (context.findRenderObject() as RenderBox)
-//                 .globalToLocal(d.globalPosition);
-//             // page-space point
-//             final p = _toPageSpace(local);
-
-//             // ignore taps outside page rect
-//             if (p.dx < 0 ||
-//                 p.dy < 0 ||
-//                 p.dx > pageSize.width ||
-//                 p.dy > pageSize.height)
-//               return;
-
-//             widget.onAddMarker(
-//               MarkerPoint(page: widget.pageNumber, x: p.dx, y: p.dy),
-//             );
-//             setState(() {}); // rep aint overlay
-//           },
-//           child: InteractiveViewer(
-//             minScale: 0.5,
-//             maxScale: 6.0,
-//             transformationController: _controller,
-//             child: Stack(
-//               key: _repaintKey,
+//           // Zoom controls
+//           Positioned(
+//             right: 16,
+//             bottom: 100,
+//             child: Column(
 //               children: [
-//                 // Center page
-//                 SizedBox(
-//                   width: math.max(pageSize.width, constraints.maxWidth),
-//                   height: math.max(pageSize.height, constraints.maxHeight),
-//                   child: FittedBox(
-//                     alignment: Alignment.center,
-//                     child: pageWidget,
-//                   ),
+//                 FloatingActionButton(
+//                   heroTag: "zoomIn",
+//                   mini: true,
+//                   onPressed: () {
+//                     _pdfController.zoomLevel = _pdfController.zoomLevel + 0.25;
+//                   },
+//                   child: const Icon(Icons.zoom_in),
 //                 ),
-//                 // Dynamic overlay using CustomPaint
-//                 Positioned.fill(
-//                   child: Positioned.fill(
-//                     child: CustomPaint(
-//                       painter: _OverlayPainter(clusters: clusters),
-//                     ),
-//                   ),
-//                   // CustomPaint(
-//                   //   painter: _OverlayPainter(
-//                   //     markers: widget.markers
-//                   //         .where((m) => m.page == widget.pageNumber)
-//                   //         .toList(),
-//                   //     transform:
-//                   //         _controller.value, // pass InteractiveViewer matrix
-//                   //   ),
-//                   // ),
+//                 const SizedBox(height: 10),
+//                 FloatingActionButton(
+//                   heroTag: "zoomOut",
+//                   mini: true,
+//                   onPressed: () {
+//                     if (_pdfController.zoomLevel > 1) {
+//                       _pdfController.zoomLevel =
+//                           _pdfController.zoomLevel - 0.25;
+//                     }
+//                   },
+//                   child: const Icon(Icons.zoom_out),
 //                 ),
-
-                
 //               ],
 //             ),
 //           ),
-//         );
-//       },
+//         ],
+//       ),
+
+//       // Toggle button → switch between marker/line mode
+//       floatingActionButton: FloatingActionButton(
+//         child: Icon(_lineMode ? Icons.show_chart : Icons.circle),
+//         onPressed: () {
+//           setState(() {
+//             _lineMode = !_lineMode;
+//             _firstTap = null; // reset first tap for line
+//           });
+//         },
+//       ),
 //     );
 //   }
 // }
 
-// /// ---------- Overlay painter: draws clusters/markers on top in screen space
-// class _OverlayPainter extends CustomPainter {
-//   final List<Cluster> clusters;
+// /// -------------------------------
+// /// MAIN APP
+// /// -------------------------------
+// Future<void> main() async {
+//   WidgetsFlutterBinding.ensureInitialized();
 
-//   _OverlayPainter({required this.clusters});
+//   // Load a PDF from assets
+//   final ByteData data = await rootBundle.load('assets/PDF.pdf');
+//   final Uint8List pdfBytes = data.buffer.asUint8List();
+
+//   runApp(MyApp(initialPdf: pdfBytes));
+// }
+
+// class MyApp extends StatelessWidget {
+//   final Uint8List initialPdf;
+//   const MyApp({super.key, required this.initialPdf});
 
 //   @override
-//   void paint(Canvas canvas, Size size) {
-//     final fill = Paint()..color = Colors.blue;
-//     final stroke = Paint()
-//       ..color = Colors.blue
-//       ..style = PaintingStyle.stroke
-//       ..strokeWidth = .2;
-
-//     final textStyle = const TextStyle(color: Colors.white, fontSize: 12);
-
-//     for (final c in clusters) {
-//       if (c.members.length == 1) {
-//         // Single marker → small dot
-//         canvas.drawCircle(c.centerScreen, 6, fill);
-//         canvas.drawCircle(c.centerScreen, 6, stroke);
-//       } else {
-//         // Cluster → bigger circle + count text
-//         const r = 12.0;
-//         canvas.drawCircle(c.centerScreen, r, fill);
-//         canvas.drawCircle(c.centerScreen, r, stroke);
-
-//         final tp = TextPainter(
-//           text: TextSpan(text: "${c.members.length}", style: textStyle),
-//           textAlign: TextAlign.center,
-//           textDirection: TextDirection.ltr,
-//         );
-//         tp.layout();
-//         tp.paint(canvas, c.centerScreen - Offset(tp.width / 2, tp.height / 2));
-//       }
-//     }
+//   Widget build(BuildContext context) {
+//     return MaterialApp(
+//       title: 'PDF Marker Demo',
+//       theme: ThemeData(primarySwatch: Colors.blue),
+//       debugShowCheckedModeBanner: false,
+//       home: PdfMarkerExample(initialPdf: initialPdf),
+//     );
 //   }
-
-//   @override
-//   bool shouldRepaint(covariant _OverlayPainter oldDelegate) => true;
 // }
 
 
 
+// // // ---------- line text ------------
 
-// // // ---------- almost done
-
-// // // import 'dart:convert';
 // // // import 'dart:developer';
 // // // import 'dart:typed_data';
 // // // import 'package:flutter/material.dart';
+// // // import 'package:flutter/foundation.dart';
 // // // import 'package:flutter/services.dart';
-// // // import 'package:http/http.dart' as http;
 // // // import 'package:syncfusion_flutter_pdf/pdf.dart';
 // // // import 'package:syncfusion_flutter_pdfviewer/pdfviewer.dart';
 
-// // // /// Marker model
+// // // /// Marker Model
 // // // class Marker {
 // // //   final int page;
-// // //   final Offset position;
-// // //   Marker(this.page, this.position);
+// // //   final Offset point;
+// // //   final String label;
+// // //   final String note;
+
+// // //   Marker(this.page, this.point, this.label, this.note);
 // // // }
 
-// // // /// Cluster model
-// // // class Cluster {
-// // //   final int page;
-// // //   final Offset center;
-// // //   final List<Marker> markers;
-// // //   Cluster(this.page, this.center, this.markers);
-// // // }
-
-// // // void main() => runApp(const MyApp());
-
-// // // class MyApp extends StatelessWidget {
-// // //   const MyApp({super.key});
-
-// // //   @override
-// // //   Widget build(BuildContext context) {
-// // //     return const MaterialApp(
-// // //       debugShowCheckedModeBanner: false,
-// // //       home: PDFClusterDemo(),
-// // //     );
-// // //   }
-// // // }
-
-// // // class PDFClusterDemo extends StatefulWidget {
-// // //   const PDFClusterDemo({super.key});
-
-// // //   @override
-// // //   State<PDFClusterDemo> createState() => _PDFClusterDemoState();
-// // // }
-
-// // // class _PDFClusterDemoState extends State<PDFClusterDemo> {
-// // //   final PdfViewerController _pdfController = PdfViewerController();
-// // //   double _zoom = 1.0;
-// // //   Uint8List _originalPdf = Uint8List(0);
-// // //   Uint8List _clusteredPdf = Uint8List(0);
-// // //   bool _isLoading = true;
-
-// // //   /// Raw markers (always preserved)
-// // //   final List<Marker> _allMarkers = [];
-
-// // //   @override
-// // //   void initState() {
-// // //     super.initState();
-// // //     _loadPdf();
-// // //   }
-
-// // //   void _zoomIn() {
-// // //     final newZoom = (_pdfController.zoomLevel + 0.5).clamp(0.5, 5.0);
-// // //     _pdfController.zoomLevel = newZoom;
-// // //     setState(() {
-// // //       _zoom = newZoom;
-// // //     });
-// // //     _updateClustering(); // Zoom change par clustering update karo
-// // //   }
-
-// // //   void _zoomOut() {
-// // //     final newZoom = (_pdfController.zoomLevel - 0.5).clamp(0.5, 5.0);
-// // //     _pdfController.zoomLevel = newZoom;
-// // //     setState(() {
-// // //       _zoom = newZoom;
-// // //     });
-// // //     _updateClustering(); // Zoom change par clustering update karo
-// // //   }
-
-
-// // //   Future<void> _loadPdf() async {
-// // //     try {
-// // //       // const url =
-// // //       //     "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf";
-// // //       // final res = await http.get(Uri.parse(url));
-// // //        final bytes = await rootBundle.load('assets/PDF.pdf');
-// // //       // if (res.statusCode == 200) {
-// // //         setState(() {
-// // //           _originalPdf = bytes.buffer.asUint8List();
-// // //           _clusteredPdf = bytes.buffer.asUint8List();
-// // //           _isLoading = false;
-// // //         });
-// // //       // }
-// // //     } catch (e) {
-// // //       log("Error loading PDF: $e");
-// // //       setState(() => _isLoading = false);
-// // //     }
-// // //   }
-
-// // //   /// Smart clustering logic based on zoom level
-// // //   List<Cluster> _makeClusters(List<Marker> markers, double zoom) {
-// // //     // Zoom level thresholds for clustering
-// // //     if (_zoom > 3.0) {
-// // //       // Maximum zoom - show all markers individually
-// // //       return markers.map((m) => Cluster(m.page, m.position, [m])).toList();
-// // //     } else if (_zoom > 1.5) {
-// // //       // Medium zoom - cluster only very close markers
-// // //       final threshold = 20 / _zoom;
-// // //       return _createClusters(markers, threshold);
-// // //     } else {
-// // //       // Small zoom - aggressive clustering
-// // //       final threshold = 40 / _zoom;
-// // //       return _createClusters(markers, threshold);
-// // //     }
-// // //   }
-
-// // //   List<Cluster> _createClusters(List<Marker> markers, double threshold) {
-// // //     final List<Cluster> clusters = [];
-// // //     final used = <Marker>{};
-
-// // //     for (final m in markers) {
-// // //       if (used.contains(m)) continue;
-
-// // //       final group = <Marker>[m];
-// // //       for (final other in markers) {
-// // //         if (other == m || used.contains(other)) continue;
-// // //         if ((other.position - m.position).distance <= threshold &&
-// // //             other.page == m.page) {
-// // //           group.add(other);
-// // //         }
-// // //       }
-
-// // //       used.addAll(group);
-
-// // //       if (group.length == 1) {
-// // //         clusters.add(Cluster(m.page, m.position, group));
-// // //       } else {
-// // //         final dx =
-// // //             group.map((e) => e.position.dx).reduce((a, b) => a + b) /
-// // //             group.length;
-// // //         final dy =
-// // //             group.map((e) => e.position.dy).reduce((a, b) => a + b) /
-// // //             group.length;
-// // //         clusters.add(Cluster(m.page, Offset(dx, dy), group));
-// // //       }
-// // //     }
-// // //     return clusters;
-// // //   }
-
-// // //   Uint8List _generateClusteredPdf(List<Marker> allMarkers, double zoom) {
-// // //     if (allMarkers.isEmpty) return _originalPdf;
-
-// // //     final doc = PdfDocument(inputBytes: _originalPdf);
-// // //     final clusters = _makeClusters(allMarkers, zoom);
-
-// // //     for (final cluster in clusters) {
-// // //       // make sure cluster.page is valid (1-based index)
-// // //       if (cluster.page < 1 || cluster.page > doc.pages.count) {
-// // //         debugPrint("⚠️ Skipping invalid page: ${cluster.page}");
-// // //         continue;
-// // //       }
-
-// // //       final page = doc.pages[cluster.page - 1]; // safe now ✅
-
-// // //       if (cluster.markers.length == 1) {
-// // //         // Single marker - Red circle with number
-// // //         final marker = cluster.markers.first;
-// // //         final markerIndex = allMarkers.indexOf(marker) + 1;
-
-// // //         _drawSingleMarker(page, marker, markerIndex);
-// // //       } else {
-// // //         // Cluster - Blue circle with count
-// // //         _drawCluster(page, cluster.center, cluster.markers.length);
-// // //       }
-// // //     }
-
-// // //     final bytes = doc.saveSync();
-// // //     doc.dispose();
-// // //     return Uint8List.fromList(bytes);
-// // //   }
-
-// // //   void _drawSingleMarker(PdfPage page, Marker marker, int index) {
-// // //     // Red background circle
-// // //     page.graphics.drawEllipse(
-// // //       Rect.fromCircle(center: marker.position, radius: 12),
-// // //       brush: PdfSolidBrush(PdfColor(220, 0, 0)),
-// // //     );
-
-// // //     // White border
-// // //     page.graphics.drawEllipse(
-// // //       Rect.fromCircle(center: marker.position, radius: 12),
-// // //       pen: PdfPen(PdfColor(255, 255, 255), width: 2),
-// // //     );
-
-// // //     // White number
-// // //     page.graphics.drawString(
-// // //       index.toString(),
-// // //       PdfStandardFont(PdfFontFamily.helvetica, 10),
-// // //       bounds: Rect.fromCenter(center: marker.position, width: 20, height: 20),
-// // //       brush: PdfSolidBrush(PdfColor(255, 255, 255)),
-// // //       format: PdfStringFormat(
-// // //         alignment: PdfTextAlignment.center,
-// // //         lineAlignment: PdfVerticalAlignment.middle,
-// // //       ),
-// // //     );
-// // //   }
-
-// // //   void _drawCluster(PdfPage page, Offset center, int count) {
-// // //     // Blue background circle
-// // //     page.graphics.drawEllipse(
-// // //       Rect.fromCircle(center: center, radius: 16),
-// // //       brush: PdfSolidBrush(PdfColor(0, 0, 220)),
-// // //     );
-
-// // //     // White border
-// // //     page.graphics.drawEllipse(
-// // //       Rect.fromCircle(center: center, radius: 16),
-// // //       pen: PdfPen(PdfColor(255, 255, 255), width: 2),
-// // //     );
-
-// // //     // White count
-// // //     page.graphics.drawString(
-// // //       count.toString(),
-// // //       PdfStandardFont(PdfFontFamily.helvetica, 12),
-// // //       bounds: Rect.fromCenter(center: center, width: 24, height: 24),
-// // //       brush: PdfSolidBrush(PdfColor(255, 255, 255)),
-// // //       format: PdfStringFormat(
-// // //         alignment: PdfTextAlignment.center,
-// // //         lineAlignment: PdfVerticalAlignment.middle,
-// // //       ),
-// // //     );
-// // //   }
-
-// // //   void _updateClustering() {
-// // //     final newPdf = _generateClusteredPdf(_allMarkers, _zoom);
-// // //     setState(() => _clusteredPdf = newPdf);
-// // //   }
-
-// // //   Future<void> _addMarker(Offset pdfPos, int pageNum) async {
-// // //     setState(() {
-// // //       _allMarkers.add(Marker(pageNum, pdfPos));
-// // //       _updateClustering();
-// // //     });
-// // //   }
-
-// // //   void _clearAllMarkers() {
-// // //     setState(() {
-// // //       _allMarkers.clear();
-// // //       _clusteredPdf = _originalPdf;
-// // //     });
-// // //   }
-
-// // //   @override
-// // //   Widget build(BuildContext context) {
-// // //     return Scaffold(
-// // //       appBar: AppBar(
-// // //         title: const Text("PDF Marker Clustering"),
-// // //         backgroundColor: Colors.blue[700],
-// // //         actions: [
-// // //           // Statistics
-// // //           Padding(
-// // //             padding: const EdgeInsets.symmetric(vertical: 14.0),
-// // //             child: Row(
-// // //               children: [
-// // //                 Text(
-// // //                   '${_allMarkers.length} markers',
-// // //                   style: TextStyle(
-// // //                     fontWeight: FontWeight.bold,
-// // //                     color: Colors.white,
-// // //                   ),
-// // //                 ),
-// // //                 SizedBox(width: 16),
-// // //                 Text(
-// // //                   '${_zoom.toStringAsFixed(1)}x',
-// // //                   style: TextStyle(
-// // //                     fontWeight: FontWeight.bold,
-// // //                     color: Colors.white,
-// // //                   ),
-// // //                 ),
-// // //                 SizedBox(width: 8),
-// // //               ],
-// // //             ),
-// // //           ),
-
-// // //           IconButton(
-// // //             icon: Icon(Icons.refresh, color: Colors.white),
-// // //             onPressed: _updateClustering,
-// // //             tooltip: "Refresh Clustering",
-// // //           ),
-// // //           IconButton(
-// // //             icon: Icon(Icons.clear, color: Colors.white),
-// // //             onPressed: _allMarkers.isEmpty ? null : _clearAllMarkers,
-// // //             tooltip: "Clear All Markers",
-// // //           ),
-// // //         ],
-// // //       ),
-// // //       body: _isLoading
-// // //           ? Center(child: CircularProgressIndicator())
-           
-// // //           : SfPdfViewer.memory(
-// // //               _clusteredPdf,
-// // //               controller: _pdfController,
-// // //                maxZoomLevel: 5.0, 
-              
-// // //               onZoomLevelChanged: (details) {
-// // //                 setState(() {
-// // //                   _zoom = details.newZoomLevel;
-// // //                   // _updateClustering();
-// // //                 });
-// // //               },
-// // //               onTap: (details) async {
-// // //                 await _addMarker(details.pagePosition, details.pageNumber);
-// // //                 setState(() {
-// // //                    _updateClustering();
-// // //                 });
-// // //               },
-// // //               pageLayoutMode: PdfPageLayoutMode.single,
-// // //               interactionMode: PdfInteractionMode.pan,
-// // //               canShowScrollHead: true,
-// // //               canShowScrollStatus: true,
-// // //             ),
-
-// // //       // Floating action button for quick actions
-// // //       floatingActionButton: Column(
-// // //         mainAxisSize: MainAxisSize.min,
-// // //         children: [
-// // //           FloatingActionButton(
-// // //             mini: true,
-// // //             child: const Icon(Icons.add),
-// // //             onPressed: () {
-// // //               _zoomIn();
-// // //             },
-// // //           ),
-// // //           const SizedBox(height: 8),
-// // //           FloatingActionButton(
-// // //             mini: true,
-// // //             child: const Icon(Icons.remove),
-// // //             onPressed: () {
-// // //               _zoomOut();
-// // //             },
-// // //           ),
-// // //         ],
-// // //       ),
-// // //     );
-// // //   }
-// // // }
-
-
-// // // -----------------------------------------
-
-// // //  zoom 10 pr muiltples markers with numbers
-// // // import 'dart:typed_data';
-// // // import 'dart:developer';
-// // // import 'package:flutter/material.dart';
-// // // import 'package:flutter/services.dart';
-// // // import 'package:syncfusion_flutter_pdfviewer/pdfviewer.dart';
-// // // import 'package:syncfusion_flutter_pdf/pdf.dart';
-// // // import 'package:flutter/foundation.dart';
-
+// // // /// Params for Marker
 // // // class MarkerParams {
 // // //   final Uint8List bytes;
 // // //   final Offset point;
 // // //   final int page;
-// // //   final int number;
+// // //   final String label;
 
-// // //   MarkerParams(this.bytes, this.point, this.page, this.number);
+// // //   MarkerParams(this.bytes, this.point, this.page, this.label);
 // // // }
 
-// // // void main() {
-// // //   runApp(const MyApp());
+// // // /// Params for Line
+// // // class LineParams {
+// // //   final Uint8List bytes;
+// // //   final int page;
+// // //   final Offset startPoint;
+// // //   final Offset endPoint;
+
+// // //   LineParams({
+// // //     required this.bytes,
+// // //     required this.page,
+// // //     required this.startPoint,
+// // //     required this.endPoint,
+// // //   });
 // // // }
 
-// // // class MyApp extends StatelessWidget {
-// // //   const MyApp({super.key});
+// // // /// Process marker embedding
+// // // Uint8List processPdfWithMarker(MarkerParams params) {
+// // //   final document = PdfDocument(inputBytes: params.bytes);
+// // //   final page = document.pages[params.page];
+
+// // //   const radius = 25.0;
+// // //   page.graphics.drawEllipse(
+// // //     Rect.fromCircle(center: params.point, radius: radius),
+// // //     pen: PdfPen(PdfColor(255, 0, 0), width: 2),
+// // //     brush: PdfSolidBrush(PdfColor(255, 0, 0)),
+// // //   );
+
+// // //   page.graphics.drawString(
+// // //     params.label,
+// // //     PdfStandardFont(PdfFontFamily.helvetica, 16, style: PdfFontStyle.bold),
+// // //     bounds: Rect.fromCenter(center: params.point, width: 50, height: 50),
+// // //     brush: PdfSolidBrush(PdfColor(255, 255, 255)),
+// // //     format: PdfStringFormat(
+// // //       alignment: PdfTextAlignment.center,
+// // //       lineAlignment: PdfVerticalAlignment.middle,
+// // //     ),
+// // //   );
+
+// // //   final newBytes = document.saveSync();
+// // //   document.dispose();
+// // //   return Uint8List.fromList(newBytes);
+// // // }
+
+// // // /// Process line embedding
+// // // Uint8List processPdfWithLine(LineParams params) {
+// // //   final document = PdfDocument(inputBytes: params.bytes);
+// // //   final page = document.pages[params.page];
+
+// // //   final pen = PdfPen(PdfColor(255, 0, 0), width: 5);
+// // //   page.graphics.drawLine(pen, params.startPoint, params.endPoint);
+
+// // //   final newBytes = document.saveSync();
+// // //   document.dispose();
+// // //   return Uint8List.fromList(newBytes);
+// // // }
+
+// // // class PdfMarkerExample extends StatefulWidget {
+// // //   final Uint8List initialPdf;
+
+// // //   const PdfMarkerExample({super.key, required this.initialPdf});
+
 // // //   @override
-// // //   Widget build(BuildContext context) {
-// // //     return MaterialApp(
-// // //       debugShowCheckedModeBanner: false,
-// // //       title: 'PDF Marker Demo',
-// // //       theme: ThemeData(primarySwatch: Colors.blue),
-// // //       home: const PDFMarkerScreen(),
-// // //     );
-// // //   }
+// // //   State<PdfMarkerExample> createState() => _PdfMarkerExampleState();
 // // // }
 
-// // // class PDFMarkerScreen extends StatefulWidget {
-// // //   const PDFMarkerScreen({super.key});
-// // //   @override
-// // //   State<PDFMarkerScreen> createState() => _PDFMarkerScreenState();
-// // // }
+// // // class _PdfMarkerExampleState extends State<PdfMarkerExample> {
+// // //   late Uint8List _pdfBytes;
+// // //   final List<Marker> _markers = [];
 
-// // // class _PDFMarkerScreenState extends State<PDFMarkerScreen> {
-// // //   final PdfViewerController _pdfController = PdfViewerController();
-// // //   Uint8List _pdfBytes = Uint8List(0);
-// // //   double _currentZoom = 1.0;
-// // //   int _markerCounter = 1;
+// // //   bool _lineMode = false;
+// // //   Offset? _firstTap;
+
+// // //   final PdfViewerController _pdfViewerController = PdfViewerController();
 
 // // //   @override
 // // //   void initState() {
 // // //     super.initState();
-// // //     _loadLocalPdf();
+// // //     _pdfBytes = widget.initialPdf;
 // // //   }
 
-// // //   Future<void> _loadLocalPdf() async {
-// // //     final bytes = await rootBundle.load('assets/PDF.pdf');
-// // //     setState(() {
-// // //       _pdfBytes = bytes.buffer.asUint8List();
-// // //     });
-// // //   }
-
-// // //   static Uint8List processPdfWithMarker(MarkerParams params) {
-// // //     final document = PdfDocument(inputBytes: params.bytes);
-// // //     final page = document.pages[params.page];
-
-// // //     // Draw red circle
-// // //     page.graphics.drawEllipse(
-// // //       Rect.fromCircle(center: params.point, radius: 12),
-// // //       pen: PdfPen(PdfColor(255, 0, 0), width: 2),
-// // //       brush: PdfSolidBrush(PdfColor(255, 0, 0)),
-// // //     );
-
-// // //     // Draw white number
-// // //     page.graphics.drawString(
-// // //       params.number.toString(),
-// // //       PdfStandardFont(PdfFontFamily.helvetica, 18),
-// // //       bounds: Rect.fromCenter(center: params.point, width: 24, height: 24),
-// // //       brush: PdfSolidBrush(PdfColor(255, 255, 255)),
-// // //       format: PdfStringFormat(
-// // //         alignment: PdfTextAlignment.center,
-// // //         lineAlignment: PdfVerticalAlignment.middle,
-// // //       ),
-// // //     );
-
-// // //     final newBytes = document.saveSync();
-// // //     document.dispose();
-// // //     return Uint8List.fromList(newBytes);
-// // //   }
-
+// // //   /// Add marker to PDF
 // // //   Future<void> _addMarker(Offset pdfPoint, int pageNumber) async {
-// // //     if (_pdfBytes.isEmpty) return;
+// // //     final label = "Reg ${_markers.length + 1}";
 
-// // //     final newBytes = await compute(
+// // //     final Uint8List newBytes = await compute(
 // // //       processPdfWithMarker,
-// // //       MarkerParams(_pdfBytes, pdfPoint, pageNumber - 1, _markerCounter),
+// // //       MarkerParams(_pdfBytes, pdfPoint, pageNumber - 1, label),
 // // //     );
 
 // // //     setState(() {
 // // //       _pdfBytes = newBytes;
-// // //       _markerCounter++;
+// // //       _markers.add(Marker(pageNumber - 1, pdfPoint, label, "Note for $label"));
 // // //     });
 // // //   }
 
-// // //   @override
-// // //   Widget build(BuildContext context) {
-// // //     return Scaffold(
-// // //       appBar: AppBar(title: const Text("PDF Marker Demo")),
-// // //       body: _pdfBytes.isEmpty
-// // //           ? const Center(child: CircularProgressIndicator())
-// // //           : SfPdfViewer.memory(
-// // //             maxZoomLevel: 10,
-// // //               _pdfBytes,
-// // //               controller: _pdfController,
-// // //               onZoomLevelChanged: (details) {
-// // //                 setState(() => _currentZoom = details.newZoomLevel);
-// // //               },
-// // //               onTap: (details) {
-// // //                 _addMarker(details.pagePosition, details.pageNumber);
-// // //               },
-// // //             ),
-// // //       floatingActionButton: Column(
-// // //         mainAxisSize: MainAxisSize.min,
-// // //         children: [
-// // //           FloatingActionButton(
-// // //             mini: true,
-// // //             child: const Icon(Icons.add),
-// // //             onPressed: () {
-// // //               setState(() {
-// // //                 _pdfController.zoomLevel += 0.5;
-// // //                 _currentZoom = _pdfController.zoomLevel;
-// // //               });
-// // //             },
-// // //           ),
-// // //           const SizedBox(height: 8),
-// // //           FloatingActionButton(
-// // //             mini: true,
-// // //             child: const Icon(Icons.remove),
-// // //             onPressed: () {
-// // //               setState(() {
-// // //                 _pdfController.zoomLevel -= 0.5;
-// // //                 _currentZoom = _pdfController.zoomLevel;
-// // //               });
-// // //             },
+// // //   /// Add line to PDF
+// // //   Future<void> _addLine(Offset pdfPoint, int pageNumber) async {
+// // //     if (_firstTap == null) {
+// // //       // first tap → starting point
+// // //       setState(() {
+// // //         _firstTap = pdfPoint;
+// // //       });
+// // //     } else {
+// // //       // second tap → draw line
+// // //       final params = LineParams(
+// // //         bytes: _pdfBytes,
+// // //         page: pageNumber - 1,
+// // //         startPoint: _firstTap!,
+// // //         endPoint: pdfPoint,
+// // //       );
+
+// // //       final newBytes = await compute(processPdfWithLine, params);
+
+// // //       setState(() {
+// // //         _pdfBytes = newBytes;
+// // //         _firstTap = null; // reset
+// // //       });
+// // //     }
+// // //   }
+
+// // //   /// Show marker details
+// // //   void _showMarkerData(Marker marker) {
+// // //     showDialog(
+// // //       context: context,
+// // //       builder: (_) => AlertDialog(
+// // //         title: Text(marker.label),
+// // //         content: Text(marker.note),
+// // //         actions: [
+// // //           TextButton(
+// // //             child: const Text("Close"),
+// // //             onPressed: () => Navigator.pop(context),
 // // //           ),
 // // //         ],
 // // //       ),
 // // //     );
 // // //   }
-// // // }
 
-// // // ----------
-
-// // // import 'dart:developer';
-// // // import 'dart:typed_data';
-// // // import 'package:flutter/material.dart';
-// // // import 'package:http/http.dart' as http;
-// // // import 'package:syncfusion_flutter_pdf/pdf.dart';
-// // // import 'package:syncfusion_flutter_pdfviewer/pdfviewer.dart';
-
-// // // /// Marker model
-// // // class Marker {
-// // //   final int page;
-// // //   final Offset position;
-// // //   Marker(this.page, this.position);
-// // // }
-
-// // // /// Cluster model
-// // // class Cluster {
-// // //   final int page;
-// // //   final Offset center;
-// // //   final List<Marker> markers;
-// // //   Cluster(this.page, this.center, this.markers);
-// // // }
-
-// // // void main() => runApp(const MyApp());
-
-// // // class MyApp extends StatelessWidget {
-// // //   const MyApp({super.key});
-
-// // //   @override
-// // //   Widget build(BuildContext context) {
-// // //     return const MaterialApp(
-// // //       debugShowCheckedModeBanner: false,
-// // //       home: PDFClusterDemo(),
-// // //     );
-// // //   }
-// // // }
-
-// // // class PDFClusterDemo extends StatefulWidget {
-// // //   const PDFClusterDemo({super.key});
-
-// // //   @override
-// // //   State<PDFClusterDemo> createState() => _PDFClusterDemoState();
-// // // }
-
-// // // class _PDFClusterDemoState extends State<PDFClusterDemo> {
-// // //   final PdfViewerController _pdfController = PdfViewerController();
-// // //   double _zoom = 1.0;
-// // //   Uint8List _originalPdf = Uint8List(0);
-// // //   Uint8List _renderedPdf = Uint8List(0);
-
-// // //   /// Raw markers (always preserved)
-// // //   final List<Marker> _allMarkers = [];
-
-// // //   @override
-// // //   void initState() {
-// // //     super.initState();
-// // //     _loadPdf();
+// // //   /// Zoom controls
+// // //   void _zoomIn() {
+// // //     _pdfViewerController.zoomLevel += 0.5;
 // // //   }
 
-// // //   Future<void> _loadPdf() async {
-// // //     const url =
-// // //         "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf";
-// // //     final res = await http.get(Uri.parse(url));
-// // //     if (res.statusCode == 200) {
-// // //       setState(() {
-// // //         _originalPdf = res.bodyBytes;
-// // //         _renderedPdf = res.bodyBytes;
-// // //       });
+// // //   void _zoomOut() {
+// // //     if (_pdfViewerController.zoomLevel > 1) {
+// // //       _pdfViewerController.zoomLevel -= 0.5;
 // // //     }
-// // //   }
-
-// // //   /// Clustering logic
-// // //   List<Cluster> _makeClusters(List<Marker> markers, double zoom) {
-// // //     const baseThreshold = 30.0; // px distance
-// // //     final threshold = baseThreshold / zoom;
-
-// // //     final List<Cluster> clusters = [];
-// // //     final used = <Marker>{};
-
-// // //     for (final m in markers) {
-// // //       if (used.contains(m)) continue;
-
-// // //       final group = <Marker>[m];
-// // //       for (final other in markers) {
-// // //         if (other == m || used.contains(other)) continue;
-// // //         if ((other.position - m.position).distance <= threshold &&
-// // //             other.page == m.page) {
-// // //           group.add(other);
-// // //         }
-// // //       }
-// // //       for (final g in group) {
-// // //         used.add(g);
-// // //       }
-
-// // //       // Average center
-// // //       final dx =
-// // //           group.map((e) => e.position.dx).reduce((a, b) => a + b) /
-// // //           group.length;
-// // //       final dy =
-// // //           group.map((e) => e.position.dy).reduce((a, b) => a + b) /
-// // //           group.length;
-// // //       clusters.add(Cluster(m.page, Offset(dx, dy), group));
-// // //     }
-// // //     return clusters;
-// // //   }
-
-// // //   /// Generate clustered PDF (always embedded, no overlay)
-// // //   Uint8List _generatePdfWithClusters(
-// // //     Uint8List baseBytes,
-// // //     List<Marker> all,
-// // //     double zoom,
-// // //   ) {
-// // //     final doc = PdfDocument(inputBytes: baseBytes);
-
-// // //     final clusters = _makeClusters(all, zoom);
-
-// // //     for (final c in clusters) {
-// // //       final page = doc.pages[c.page - 1];
-// // //       if (c.markers.length == 1) {
-// // //         // Single marker → draw circle with number
-// // //         final m = c.markers.first;
-// // //         page.graphics.drawEllipse(
-// // //           Rect.fromCircle(center: m.position, radius: 10),
-// // //           pen: PdfPen(PdfColor(255, 0, 0), width: 2),
-// // //           brush: PdfSolidBrush(PdfColor(255, 0, 0)),
-// // //         );
-// // //         page.graphics.drawString(
-// // //           (_allMarkers.indexOf(m) + 1).toString(),
-// // //           PdfStandardFont(PdfFontFamily.helvetica, 12),
-// // //           bounds: Rect.fromCenter(center: m.position, width: 20, height: 20),
-// // //           brush: PdfSolidBrush(PdfColor(255, 255, 255)),
-// // //           format: PdfStringFormat(
-// // //             alignment: PdfTextAlignment.center,
-// // //             lineAlignment: PdfVerticalAlignment.middle,
-// // //           ),
-// // //         );
-// // //       } else {
-// // //         // Cluster → blue circle with count
-// // //         page.graphics.drawEllipse(
-// // //           Rect.fromCircle(center: c.center, radius: 14),
-// // //           pen: PdfPen(PdfColor(0, 0, 255), width: 2),
-// // //           brush: PdfSolidBrush(PdfColor(0, 0, 255)),
-// // //         );
-// // //         page.graphics.drawString(
-// // //           c.markers.length.toString(),
-// // //           PdfStandardFont(PdfFontFamily.helvetica, 12),
-// // //           bounds: Rect.fromCenter(center: c.center, width: 24, height: 24),
-// // //           brush: PdfSolidBrush(PdfColor(255, 255, 255)),
-// // //           format: PdfStringFormat(
-// // //             alignment: PdfTextAlignment.center,
-// // //             lineAlignment: PdfVerticalAlignment.middle,
-// // //           ),
-// // //         );
-// // //       }
-// // //     }
-
-// // //     final bytes = doc.saveSync();
-// // //     doc.dispose();
-// // //     return Uint8List.fromList(bytes);
-// // //   }
-
-// // //   void _refreshPdf() {
-// // //     final newBytes = _generatePdfWithClusters(_originalPdf, _allMarkers, _zoom);
-// // //     setState(() {
-// // //       _renderedPdf = newBytes;
-// // //     });
-// // //   }
-
-// // //   void _addMarker(Offset pdfPos, int pageNum) {
-// // //     _allMarkers.add(Marker(pageNum, pdfPos));
-// // //     _refreshPdf();
-// // //   }
-
-// // //   /// Final save with all markers individually
-// // //   Uint8List _exportFinalPdf() {
-// // //     final doc = PdfDocument(inputBytes: _originalPdf);
-// // //     for (var i = 0; i < _allMarkers.length; i++) {
-// // //       final m = _allMarkers[i];
-// // //       final page = doc.pages[m.page - 1];
-// // //       page.graphics.drawEllipse(
-// // //         Rect.fromCircle(center: m.position, radius: 10),
-// // //         pen: PdfPen(PdfColor(200, 0, 0), width: 2),
-// // //         brush: PdfSolidBrush(PdfColor(200, 0, 0)),
-// // //       );
-// // //       page.graphics.drawString(
-// // //         (i + 1).toString(),
-// // //         PdfStandardFont(PdfFontFamily.helvetica, 12),
-// // //         bounds: Rect.fromCenter(center: m.position, width: 20, height: 20),
-// // //         brush: PdfSolidBrush(PdfColor(255, 255, 255)),
-// // //         format: PdfStringFormat(
-// // //           alignment: PdfTextAlignment.center,
-// // //           lineAlignment: PdfVerticalAlignment.middle,
-// // //         ),
-// // //       );
-// // //     }
-// // //     final bytes = doc.saveSync();
-// // //     doc.dispose();
-// // //     return Uint8List.fromList(bytes);
 // // //   }
 
 // // //   @override
 // // //   Widget build(BuildContext context) {
 // // //     return Scaffold(
 // // //       appBar: AppBar(
-// // //         title: const Text("Clustered PDF Markers"),
+// // //         title: const Text("PDF Marker & Line Example"),
 // // //         actions: [
-// // //           IconButton(
-// // //             icon: const Icon(Icons.save),
-// // //             onPressed: () {
-// // //               final finalBytes = _exportFinalPdf();
-// // //               log("✅ Final PDF saved with ${_allMarkers.length} markers");
-// // //             },
-// // //           ),
+// // //           IconButton(icon: const Icon(Icons.zoom_in), onPressed: _zoomIn),
+// // //           IconButton(icon: const Icon(Icons.zoom_out), onPressed: _zoomOut),
 // // //         ],
 // // //       ),
-// // //       body: _renderedPdf.isEmpty
-// // //           ? const Center(child: CircularProgressIndicator())
-// // //           : SfPdfViewer.memory(
-// // //               _renderedPdf,
-// // //               controller: _pdfController,
-// // //               onZoomLevelChanged: (details) {
-// // //                 setState(() => _zoom = details.newZoomLevel);
-// // //               },
-// // //               onTap: (details) {
-// // //                 _addMarker(details.pagePosition, details.pageNumber);
-// // //               },
-// // //             ),
+// // //       body: SfPdfViewer.memory(
+// // //         _pdfBytes,
+// // //         controller: _pdfViewerController,
+// // //         onTap: (details) {
+// // //           if (_lineMode) {
+// // //             _addLine(details.pagePosition, details.pageNumber);
+// // //             return;
+// // //           }
+
+// // //           // marker logic
+// // //           final tappedPoint = details.pagePosition;
+// // //           for (var m in _markers) {
+// // //             if ((m.page + 1) == details.pageNumber) {
+// // //               final dx = (tappedPoint.dx - m.point.dx).abs();
+// // //               final dy = (tappedPoint.dy - m.point.dy).abs();
+// // //               if (dx < 20 && dy < 20) {
+// // //                 _showMarkerData(m);
+// // //                 return;
+// // //               }
+// // //             }
+// // //           }
+// // //           _addMarker(details.pagePosition, details.pageNumber);
+// // //         },
+// // //       ),
+// // //       floatingActionButton: FloatingActionButton(
+// // //         child: Icon(_lineMode ? Icons.show_chart : Icons.circle),
+// // //         onPressed: () {
+// // //           setState(() {
+// // //             _lineMode = !_lineMode;
+// // //             _firstTap = null; // reset
+// // //           });
+// // //         },
+// // //       ),
 // // //     );
 // // //   }
 // // // }
-
-// // // // ------- pdf tron -----
-// // // import 'dart:developer';
-// // // import 'dart:io';
-// // // import 'package:flutter/material.dart';
-// // // import 'package:pdftron_flutter/pdftron_flutter.dart';
-// // // import 'package:http/http.dart' as http;
-// // // import 'package:path_provider/path_provider.dart';
 
 // // // Future<void> main() async {
 // // //   WidgetsFlutterBinding.ensureInitialized();
 
-// // //   // initialize Pdftron
-// // //   await PdftronFlutter.initialize('');
+// // //   // Load a PDF from assets
+// // //   final ByteData data = await rootBundle.load('assets/PDF.pdf');
+// // //   final Uint8List pdfBytes = data.buffer.asUint8List();
 
-// // //   runApp(const MyApp());
+// // //   runApp(MyApp(initialPdf: pdfBytes));
 // // // }
 
 // // // class MyApp extends StatelessWidget {
-// // //   const MyApp({super.key});
+// // //   final Uint8List initialPdf;
+// // //   const MyApp({super.key, required this.initialPdf});
 
 // // //   @override
 // // //   Widget build(BuildContext context) {
-// // //     return const MaterialApp(home: PdfViewerScreen());
-// // //   }
-// // // }
-
-// // // class PdfViewerScreen extends StatefulWidget {
-// // //   const PdfViewerScreen({super.key});
-
-// // //   @override
-// // //   State<PdfViewerScreen> createState() => _PdfViewerScreenState();
-// // // }
-
-// // // class _PdfViewerScreenState extends State<PdfViewerScreen> {
-// // //   bool _loading = true;
-
-// // //   @override
-// // //   void initState() {
-// // //     super.initState();
-// // //     _loadPdf();
-// // //   }
-
-// // //   Future<void> _loadPdf() async {
-// // //     try {
-// // //       // 🔽 Step 1: Download file
-// // //       final url =
-// // //           "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf";
-// // //       final response = await http.get(Uri.parse(url));
-
-// // //       if (response.statusCode == 200) {
-// // //         // 🔽 Step 2: Save to temp dir
-// // //         final dir = await getTemporaryDirectory();
-// // //         final file = File("${dir.path}/sample.pdf");
-// // //         await file.writeAsBytes(response.bodyBytes);
-
-// // //         // 🔽 Step 3: Open with Pdftron
-// // //         // await PdftronFlutter.openDocument(file.path);
-// // //         await PdftronFlutter.openDocument(
-// // //           file.path,
-// // //           config: Config()
-// // //             ..disabledElements = [
-// // //               "toolsButton",
-// // //               "searchButton",
-// // //               "shareButton",
-// // //               "viewControlsButton",
-// // //               "thumbnailsButton",
-// // //               "listsButton",
-// // //               "editPagesButton",
-// // //               "moreItemsButton",
-// // //             ]
-// // //             ..disabledTools = [
-// // //               "annotationCreateTextHighlight",
-// // //               "stickyTool",
-// // //               "eraserTool",
-// // //             ]
-// // //             ..hideTopToolbars = true
-// // //             ..hideBottomToolbar = true
-// // //             ..multiTabEnabled = false,
-// // //         );
-// // //       } else {
-// // //         log("Download failed: ${response.statusCode}");
-// // //       }
-// // //     } catch (e) {
-// // //       log("Error loading PDF: $e");
-// // //     } finally {
-// // //       setState(() => _loading = false);
-// // //     }
-// // //   }
-
-// // //     Future<void> _addCircleAtTap(Offset localPosition) async {
-// // //     // ⚠️ Yeh coordinate screen ka hai, PDF page coordinate nahi
-// // //     // Demo ke liye fixed rect use kar rahe hain
-// // //     String circleAnnot = """
-// // //     <xfdf xmlns="http://ns.adobe.com/xfdf/" xml:space="preserve">
-// // //       <annots>
-// // //         <circle page="1" rect="100,100,200,200" interior-color="#FF0000" color="#FF0000"/>
-// // //       </annots>
-// // //     </xfdf>
-// // //     """;
-
-// // //     await PdftronFlutter.importAnnotationCommand(circleAnnot);
-// // //   }
-
-// // //   @override
-// // //   Widget build(BuildContext context) {
-// // //     return Scaffold(
-// // //       body: GestureDetector(
-// // //         onTapDown: (details) async {
-// // //           await _addCircleAtTap(details.localPosition);
-// // //         },
-// // //         child: const SizedBox.expand(), // transparent overlay
-// // //       ),
+// // //     return MaterialApp(
+// // //       title: 'PDF Marker Demo',
+// // //       theme: ThemeData(primarySwatch: Colors.blue),
+// // //       debugShowCheckedModeBanner: false,
+// // //       home: PdfMarkerExample(initialPdf: initialPdf),
 // // //     );
 // // //   }
 // // // }
+
+
+
+// // // // // text embeded + data save on anotation
+
+// // // // // import 'dart:typed_data';
+// // // // import 'dart:developer';
+// // // // import 'package:flutter/material.dart';
+// // // // import 'package:flutter/services.dart';
+// // // // import 'package:syncfusion_flutter_pdfviewer/pdfviewer.dart';
+// // // // import 'package:syncfusion_flutter_pdf/pdf.dart';
+// // // // // import 'package:http/http.dart' as http;
+// // // // import 'package:flutter/foundation.dart';
+
+// // // // class MarkerParams {
+// // // //   final Uint8List bytes;
+// // // //   final Offset point;
+// // // //   final int page;
+// // // //   final int number; // marker ka asli int number
+// // // //   final String label; // 👈 reg 1, reg 2 etc.
+// // // //   final double zoom;
+// // // //   final String note; // 👈 extra note
+
+// // // //   MarkerParams(
+// // // //     this.bytes,
+// // // //     this.point,
+// // // //     this.page,
+// // // //     this.number,
+// // // //     this.label,
+// // // //     this.zoom, {
+// // // //     this.note = "",
+// // // //   });
+// // // // }
+
+// // // // void main() {
+// // // //   runApp(const MyApp());
+// // // // }
+
+// // // // class MyApp extends StatelessWidget {
+// // // //   const MyApp({super.key});
+// // // //   @override
+// // // //   Widget build(BuildContext context) {
+// // // //     return MaterialApp(
+// // // //       debugShowCheckedModeBanner: false,
+// // // //       title: 'PDF Marker Demo',
+// // // //       theme: ThemeData(primarySwatch: Colors.blue),
+// // // //       home: const PDFMarkerScreen(),
+// // // //     );
+// // // //   }
+// // // // }
+
+// // // // class PDFMarkerScreen extends StatefulWidget {
+// // // //   const PDFMarkerScreen({super.key});
+// // // //   @override
+// // // //   State<PDFMarkerScreen> createState() => _PDFMarkerScreenState();
+// // // // }
+
+// // // // class _PDFMarkerScreenState extends State<PDFMarkerScreen> {
+// // // //   List<MarkerParams> _markers = []; // sab markers yahan store honge
+
+// // // //   final PdfViewerController _pdfController = PdfViewerController();
+// // // //   Uint8List _pdfBytes = Uint8List(0);
+// // // //   double _currentZoom = 1.0;
+  
+
+// // // //   // Future<void> _loadPdfFromNetwork() async {
+// // // //   //   const url =
+// // // //   //       "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf";
+// // // //   //   final response = await http.get(Uri.parse(url));
+// // // //   //   if (response.statusCode == 200) {
+// // // //   //     setState(() => _pdfBytes = response.bodyBytes);
+// // // //   //   } else {
+// // // //   //     throw Exception("PDF load failed");
+// // // //   //   }
+// // // //   // }
+
+// // // //   Future<void> _loadLocalPdf() async {
+// // // //     final bytes = await rootBundle.load('assets/PDF.pdf');
+// // // //     setState(() {
+// // // //       _pdfBytes = bytes.buffer.asUint8List();
+// // // //     });
+// // // //   }
+
+// // // //   @override
+// // // //   void initState() {
+// // // //     super.initState();
+// // // //     // _loadPdfFromNetwork();
+// // // //     _loadLocalPdf();
+// // // //   }
+
+// // // //   static Uint8List processPdfWithMarker(MarkerParams params) {
+// // // //     final document = PdfDocument(inputBytes: params.bytes);
+// // // //     final page = document.pages[params.page];
+
+// // // //     // 👇 Font define karo
+// // // //     final font = PdfStandardFont(
+// // // //       PdfFontFamily.helvetica,
+// // // //       25,
+// // // //       style: PdfFontStyle.bold,
+// // // //     );
+
+// // // //     // 👇 Text ka size measure karo
+// // // //     final textSize = font.measureString(params.label);
+
+// // // //     // 👇 Circle radius calculate: text width ya height ka aadha + thoda padding
+// // // //     final radius =
+// // // //         (textSize.width > textSize.height ? textSize.width : textSize.height) /
+// // // //             2 +
+// // // //         10; // padding for safe margin
+
+// // // //     // Draw red circle
+// // // //     page.graphics.drawEllipse(
+// // // //       Rect.fromCircle(center: params.point, radius: radius),
+// // // //       pen: PdfPen(PdfColor(255, 0, 0), width: 2),
+// // // //       brush: PdfSolidBrush(PdfColor(255, 0, 0)),
+// // // //     );
+
+// // // //     // Draw white bold text inside circle
+// // // //     page.graphics.drawString(
+// // // //       params.label,
+// // // //       font,
+// // // //       bounds: Rect.fromCenter(
+// // // //         center: params.point,
+// // // //         width: radius * 2,
+// // // //         height: radius * 2,
+// // // //       ),
+// // // //       brush: PdfSolidBrush(PdfColor(255, 255, 255)),
+// // // //       format: PdfStringFormat(
+// // // //         alignment: PdfTextAlignment.center,
+// // // //         lineAlignment: PdfVerticalAlignment.middle,
+// // // //       ),
+// // // //     );
+
+// // // //     final newBytes = document.saveSync();
+// // // //     document.dispose();
+// // // //     return Uint8List.fromList(newBytes);
+// // // //   }
+
+// // // //   // static Uint8List processPdfWithMarker(MarkerParams params) {
+// // // //   //   final document = PdfDocument(inputBytes: params.bytes);
+// // // //   //   final page = document.pages[params.page];
+
+// // // //   //   // Draw red circle
+// // // //   //   const radius = 30.0;
+// // // //   //   page.graphics.drawEllipse(
+// // // //   //     Rect.fromCircle(center: params.point, radius: radius),
+// // // //   //     pen: PdfPen(PdfColor(255, 0, 0), width: 2),
+// // // //   //     brush: PdfSolidBrush(PdfColor(255, 0, 0)),
+// // // //   //   );
+
+// // // //   //   // Draw white bold text inside circle
+// // // //   //   page.graphics.drawString(
+// // // //   //     params.label, // 👈 ab reg 1, reg 2 likhega
+// // // //   //     PdfStandardFont(PdfFontFamily.helvetica, 20, style: PdfFontStyle.bold),
+// // // //   //     bounds: Rect.fromCenter(center: params.point, width: 50, height: 50),
+// // // //   //     brush: PdfSolidBrush(PdfColor(255, 255, 255)),
+// // // //   //     format: PdfStringFormat(
+// // // //   //       alignment: PdfTextAlignment.center,
+// // // //   //       lineAlignment: PdfVerticalAlignment.middle,
+// // // //   //     ),
+// // // //   //   );
+
+// // // //   //   final newBytes = document.saveSync();
+// // // //   //   document.dispose();
+// // // //   //   return Uint8List.fromList(newBytes);
+// // // //   // }
+
+// // // //   Future<void> _addMarker(Offset pdfPoint, int pageNumber) async {
+// // // //     if (_pdfBytes.isEmpty) return;
+
+// // // //     // 👇 Nearby markers detect karna
+// // // //     final nearbyMarkers = _markers.where((m) {
+// // // //       if ((m.page + 1) != pageNumber) return false;
+// // // //       final dx = (pdfPoint.dx - m.point.dx).abs();
+// // // //       final dy = (pdfPoint.dy - m.point.dy).abs();
+// // // //       return dx < 150 && dy < 150; // 👈 150px radius ke andar
+// // // //     }).toList();
+
+// // // //     // 👇 User se note input dialog
+// // // //     final note = await showDialog<String>(
+// // // //       context: context,
+// // // //       builder: (context) {
+// // // //         final controller = TextEditingController();
+// // // //         return AlertDialog(
+// // // //           title: const Text("Add Note for Marker"),
+// // // //           content: Column(
+// // // //             mainAxisSize: MainAxisSize.min,
+// // // //             crossAxisAlignment: CrossAxisAlignment.start,
+// // // //             children: [
+// // // //               if (nearbyMarkers.isNotEmpty) ...[
+// // // //                 const Text("Nearby markers:"),
+// // // //                 Wrap(
+// // // //                   spacing: 8,
+// // // //                   children: nearbyMarkers
+// // // //                       .map((m) => Chip(label: Text(m.label)))
+// // // //                       .toList(),
+// // // //                 ),
+// // // //                 const SizedBox(height: 12),
+// // // //               ],
+// // // //               TextField(
+// // // //                 controller: controller,
+// // // //                 decoration: const InputDecoration(
+// // // //                   hintText: "Enter your note...",
+// // // //                 ),
+// // // //               ),
+// // // //             ],
+// // // //           ),
+// // // //           actions: [
+// // // //             TextButton(
+// // // //               child: const Text("Cancel"),
+// // // //               onPressed: () => Navigator.pop(context),
+// // // //             ),
+// // // //             TextButton(
+// // // //               child: const Text("Save"),
+// // // //               onPressed: () => Navigator.pop(context, controller.text),
+// // // //             ),
+// // // //           ],
+// // // //         );
+// // // //       },
+// // // //     );
+
+// // // //     if (note == null || note.isEmpty) return;
+
+// // // //     try {
+// // // //       final markerNumber = _markers.length + 1;
+// // // //       final markerLabel = "reg $markerNumber";
+
+// // // //       final params = MarkerParams(
+// // // //         _pdfBytes,
+// // // //         pdfPoint,
+// // // //         pageNumber - 1,
+// // // //         markerNumber,
+// // // //         markerLabel,
+// // // //         _currentZoom,
+// // // //         note: note,
+// // // //       );
+
+// // // //       final Uint8List newBytes = await compute(processPdfWithMarker, params);
+
+// // // //       setState(() {
+// // // //         _pdfBytes = newBytes;
+// // // //         _markers.add(params);
+// // // //       });
+// // // //     } catch (e) {
+// // // //       log('Error adding marker: $e');
+// // // //     }
+// // // //   }
+
+// // // //   void _showMarkerData(MarkerParams marker) {
+// // // //     showDialog(
+// // // //       context: context,
+// // // //       builder: (context) => AlertDialog(
+// // // //         title: Text("Marker ${marker.number}"),
+// // // //         content: Text(marker.note),
+// // // //         actions: [
+// // // //           TextButton(
+// // // //             child: Text("Close"),
+// // // //             onPressed: () => Navigator.pop(context),
+// // // //           ),
+// // // //         ],
+// // // //       ),
+// // // //     );
+// // // //   }
+
+// // // //   @override
+// // // //   Widget build(BuildContext context) {
+// // // //     return Scaffold(
+// // // //       appBar: AppBar(
+// // // //         title: const Text("PDF Marker with Zoom"),
+// // // //         actions: [
+// // // //           IconButton(
+// // // //             icon: const Icon(Icons.list),
+// // // //             onPressed: () {
+// // // //               for (var m in _markers) {
+// // // //                 log(
+// // // //                   "Marker ${m.number} -> Page: ${m.page + 1}, X: ${m.point.dx}, Y: ${m.point.dy}",
+// // // //                 );
+// // // //               }
+// // // //             },
+// // // //           ),
+// // // //         ],
+// // // //       ),
+// // // //       body: SfPdfViewer.memory(
+// // // //         _pdfBytes,
+// // // //         controller: _pdfController,
+// // // //         onZoomLevelChanged: (PdfZoomDetails details) {
+// // // //           setState(() => _currentZoom = details.newZoomLevel);
+// // // //           log("deatils zoom ${details.newZoomLevel}");
+// // // //         },
+// // // //         // onTap: (PdfGestureDetails details) {
+// // // //         //   _addMarker(details.pagePosition, details.pageNumber);
+// // // //         // },
+// // // //         onTap: (PdfGestureDetails details) {
+// // // //           final tappedPoint = details.pagePosition;
+
+// // // //           // 👇 check marker hit
+// // // //           for (var m in _markers) {
+// // // //             if ((m.page + 1) == details.pageNumber) {
+// // // //               final dx = (tappedPoint.dx - m.point.dx).abs();
+// // // //               final dy = (tappedPoint.dy - m.point.dy).abs();
+// // // //               if (dx < 20 && dy < 20) {
+// // // //                 // circle radius check
+// // // //                 _showMarkerData(m);
+// // // //                 return;
+// // // //               }
+// // // //             }
+// // // //           }
+
+// // // //           // warna naya marker banega
+// // // //           _addMarker(details.pagePosition, details.pageNumber);
+// // // //         },
+// // // //       ),
+// // // //       floatingActionButton: Column(
+// // // //         mainAxisSize: MainAxisSize.min,
+// // // //         children: [
+// // // //           FloatingActionButton(
+// // // //             mini: true,
+// // // //             child: const Icon(Icons.add),
+// // // //             onPressed: () {
+// // // //               setState(() {
+// // // //                 _pdfController.zoomLevel += 0.5;
+// // // //                 _currentZoom = _pdfController.zoomLevel;
+// // // //               });
+// // // //               log(_currentZoom.toString());
+// // // //             },
+// // // //           ),
+// // // //           const SizedBox(height: 8),
+// // // //           FloatingActionButton(
+// // // //             mini: true,
+// // // //             child: const Icon(Icons.remove),
+// // // //             onPressed: () {
+// // // //               setState(() {
+// // // //                 _pdfController.zoomLevel -= 0.5;
+// // // //                 _currentZoom = _pdfController.zoomLevel;
+// // // //               });
+// // // //             },
+// // // //           ),
+// // // //         ],
+// // // //       ),
+// // // //     );
+// // // //   }
+// // // // }
+
+
+
+// // // // // // ------------ paint style---------------
+
+// // // // import 'dart:typed_data';
+// // // // import 'dart:math' as math;
+// // // // import 'package:flutter/material.dart';
+// // // // import 'package:flutter/services.dart' show rootBundle;
+// // // // import 'package:pdfx/pdfx.dart';
+// // // // import 'package:syncfusion_flutter_pdf/pdf.dart' as sf;
+// // // // import 'package:vector_math/vector_math_64.dart' show Vector3;
+
+// // // // /// ---------- Models
+
+// // // // class MarkerPoint {
+// // // //   final int page; // 1-based page index
+// // // //   final double x; // page-space X (pixels of the rendered page image)
+// // // //   final double y; // page-space Y
+// // // //   MarkerPoint({required this.page, required this.x, required this.y});
+// // // // }
+
+// // // // class Cluster {
+// // // //   final Offset centerScreen; // screen-space position (after transform)
+// // // //   final List<MarkerPoint> members;
+// // // //   Cluster({required this.centerScreen, required this.members});
+// // // // }
+
+// // // // /// ---------- App
+
+// // // // void main() => runApp(
+// // // //   const MaterialApp(debugShowCheckedModeBanner: false, home: PdfClusterDemo()),
+// // // // );
+
+// // // // class PdfClusterDemo extends StatefulWidget {
+// // // //   const PdfClusterDemo({super.key});
+// // // //   @override
+// // // //   State<PdfClusterDemo> createState() => _PdfClusterDemoState();
+// // // // }
+
+// // // // class _PdfClusterDemoState extends State<PdfClusterDemo> {
+// // // //   late Future<_DocBundle> _bundleFut;
+
+// // // //   // store markers across pages; here demo uses only page 1
+// // // //   final List<MarkerPoint> _markers = [];
+
+// // // //   // PDF bytes to export annotations later
+// // // //   Uint8List _pdfBytes = Uint8List(0);
+
+// // // //   @override
+// // // //   void initState() {
+// // // //     super.initState();
+// // // //     _bundleFut = _load();
+// // // //   }
+
+// // // //   Future<_DocBundle> _load() async {
+// // // //     // Load from assets (use your own source if needed)
+// // // //     final bytes = await rootBundle.load('assets/PDF.pdf');
+// // // //     _pdfBytes = bytes.buffer.asUint8List();
+
+// // // //     // Open with pdfx for raster rendering info
+// // // //     final doc = await PdfDocument.openData(_pdfBytes);
+
+// // // //     // We'll just show page 1 in this minimal demo
+// // // //     final page = await doc.getPage(1);
+
+// // // //     // render page as image just to get its dimensions
+// // // //     final pageImage = await page.render(
+// // // //       width: page.width,
+// // // //       height: page.height,
+// // // //       format: PdfPageImageFormat.png,
+// // // //     );
+
+// // // //     await page.close();
+
+// // // //     return _DocBundle(
+// // // //       pdfBytes: _pdfBytes,
+
+// // // //       firstPageSize: Size(
+// // // //         pageImage!.width!.toDouble(),
+// // // //         pageImage.height!.toDouble(),
+// // // //       ),
+// // // //       doc: doc,
+// // // //     );
+// // // //   }
+
+// // // //   Future<void> _exportWithAnnotations() async {
+// // // //     if (_pdfBytes.isEmpty) return;
+// // // //     final pdf = sf.PdfDocument(inputBytes: _pdfBytes);
+
+// // // //     for (final m in _markers) {
+// // // //       if (m.page < 1 || m.page > pdf.pages.count) continue;
+// // // //       final page = pdf.pages[m.page - 1];
+
+// // // //       // We saved marker coords in "rendered image pixels".
+// // // //       // Syncfusion page's size is in PDF units (points; 72 dpi).
+// // // //       // For simplicity we assume 1 image pixel == 1 PDF unit because pdfx default page size comes from 72 dpi.
+// // // //       // If you render at another scale, multiply by (pdfWidth/renderedWidth, pdfHeight/renderedHeight).
+// // // //       final r = 10.0;
+// // // //       page.graphics.drawEllipse(
+// // // //         Rect.fromCircle(center: Offset(m.x, m.y), radius: r),
+// // // //         brush: sf.PdfSolidBrush(sf.PdfColor(220, 0, 0)),
+// // // //         pen: sf.PdfPen(sf.PdfColor(255, 255, 255), width: 2),
+// // // //       );
+// // // //     }
+
+// // // //     final out = pdf.saveSync();
+// // // //     pdf.dispose();
+
+// // // //     // TODO: write `out` to a file via path_provider. For demo we just show a SnackBar.
+// // // //     if (mounted) {
+// // // //       ScaffoldMessenger.of(context).showSnackBar(
+// // // //         const SnackBar(
+// // // //           content: Text('PDF exported with annotations (bytes ready).'),
+// // // //         ),
+// // // //       );
+// // // //     }
+// // // //   }
+
+// // // //   @override
+// // // //   Widget build(BuildContext context) {
+// // // //     return FutureBuilder<_DocBundle>(
+// // // //       future: _bundleFut,
+// // // //       builder: (context, snap) {
+// // // //         final b = snap.data!;
+// // // //         if (!snap.hasData) {
+// // // //           return const Scaffold(
+// // // //             body: Center(child: CircularProgressIndicator()),
+// // // //           );
+// // // //         }
+// // // //         return Scaffold(
+// // // //           appBar: AppBar(
+// // // //             title: const Text('PDF Clustering Overlay'),
+// // // //             actions: [
+// // // //               TextButton.icon(
+// // // //                 onPressed: _markers.isEmpty ? null : _exportWithAnnotations,
+// // // //                 icon: const Icon(Icons.save, color: Colors.white),
+// // // //                 label: const Text(
+// // // //                   'Export',
+// // // //                   style: TextStyle(color: Colors.blue),
+// // // //                 ),
+// // // //               ),
+// // // //             ],
+// // // //           ),
+// // // //           body: PdfClusterPage(
+// // // //             pdfDoc: b.doc,
+// // // //             pageNumber: 1,
+// // // //             pageSize: b.firstPageSize,
+// // // //             markers: _markers,
+// // // //             onAddMarker: (m) => setState(() => _markers.add(m)),
+// // // //           ),
+// // // //           floatingActionButton: FloatingActionButton.extended(
+// // // //             onPressed: () => setState(() => _markers.clear()),
+// // // //             label: const Text('Clear markers'),
+// // // //             icon: const Icon(Icons.clear),
+// // // //           ),
+// // // //         );
+// // // //       },
+// // // //     );
+// // // //   }
+// // // // }
+
+// // // // class _DocBundle {
+// // // //   final Uint8List pdfBytes;
+// // // //   final PdfDocument doc;
+// // // //   final Size firstPageSize;
+
+// // // //   _DocBundle({
+// // // //     required this.pdfBytes,
+// // // //     required this.doc,
+// // // //     required this.firstPageSize,
+// // // //   });
+// // // // }
+
+// // // // /// ---------- The core widget (one page)
+
+// // // // class PdfClusterPage extends StatefulWidget {
+// // // //   final PdfDocument pdfDoc;
+// // // //   final int pageNumber;
+// // // //   final Size pageSize; // pixels of rastered page at 72 dpi
+// // // //   final List<MarkerPoint> markers;
+// // // //   final ValueChanged<MarkerPoint> onAddMarker;
+
+// // // //   const PdfClusterPage({
+// // // //     super.key,
+// // // //     required this.pdfDoc,
+// // // //     required this.pageNumber,
+// // // //     required this.pageSize,
+// // // //     required this.markers,
+// // // //     required this.onAddMarker,
+// // // //   });
+
+// // // //   @override
+// // // //   State<PdfClusterPage> createState() => _PdfClusterPageState();
+// // // // }
+
+// // // // class _PdfClusterPageState extends State<PdfClusterPage> {
+// // // //   final _controller = TransformationController();
+// // // //   final _repaintKey = GlobalKey();
+
+// // // //   double get _scale => _controller.value.getMaxScaleOnAxis();
+
+// // // //   /// Convert a global/local position (on the viewer) to page-space coordinates
+// // // //   Offset _toPageSpace(Offset local) {
+// // // //     final inv = Matrix4.inverted(_controller.value);
+// // // //     final vec3 = inv.transform3(Vector3(local.dx, local.dy, 0));
+// // // //     return Offset(vec3.x, vec3.y);
+// // // //   }
+
+// // // //   /// Convert a page-space position to current screen-space (after transform)
+// // // //   Offset _toScreenSpace(Offset pagePos) {
+// // // //     final v = _controller.value.transform3(Vector3(pagePos.dx, pagePos.dy, 0));
+// // // //     return Offset(v.x, v.y);
+// // // //   }
+
+// // // //   List<Cluster> _computeClusters(Size screenSize) {
+// // // //     // project each marker to screen space
+// // // //     final pts = <Offset>[];
+// // // //     final list = <MarkerPoint>[];
+
+// // // //     for (final m in widget.markers.where(
+// // // //       (mm) => mm.page == widget.pageNumber,
+// // // //     )) {
+// // // //       final ss = _toScreenSpace(Offset(m.x, m.y));
+// // // //       pts.add(ss);
+// // // //       list.add(m);
+// // // //     }
+
+// // // //     final clusters = <Cluster>[];
+// // // //     const baseThreshold = 60.0; // px (screen) — tweak as you like
+// // // //     final threshold = baseThreshold; // already in screen space, no scale needed
+
+// // // //     final used = List<bool>.filled(pts.length, false);
+// // // //     for (int i = 0; i < pts.length; i++) {
+// // // //       if (used[i]) continue;
+// // // //       final groupIdx = <int>[i];
+// // // //       for (int j = i + 1; j < pts.length; j++) {
+// // // //         if (used[j]) continue;
+// // // //         if ((pts[i] - pts[j]).distance <= threshold) {
+// // // //           groupIdx.add(j);
+// // // //         }
+// // // //       }
+// // // //       for (final gi in groupIdx) {
+// // // //         used[gi] = true;
+// // // //       }
+// // // //       // center = avg screen position
+// // // //       final cx =
+// // // //           groupIdx.map((k) => pts[k].dx).reduce((a, b) => a + b) /
+// // // //           groupIdx.length;
+// // // //       final cy =
+// // // //           groupIdx.map((k) => pts[k].dy).reduce((a, b) => a + b) /
+// // // //           groupIdx.length;
+// // // //       clusters.add(
+// // // //         Cluster(
+// // // //           centerScreen: Offset(cx, cy),
+// // // //           members: groupIdx.map((k) => list[k]).toList(),
+// // // //         ),
+// // // //       );
+// // // //     }
+
+// // // //     return clusters;
+// // // //   }
+
+// // // //   @override
+// // // //   Widget build(BuildContext context) {
+// // // //     final pageSize = widget.pageSize;
+
+// // // //     return LayoutBuilder(
+// // // //       builder: (context, constraints) {
+// // // //         // Center the page in the available space
+// // // //         final pageWidget = FutureBuilder<PdfPageImage>(
+// // // //           future: widget.pdfDoc.getPage(widget.pageNumber).then((page) async {
+// // // //             final img = await page.render(
+// // // //               width: widget.pageSize.width,
+// // // //               height: widget.pageSize.height,
+// // // //             );
+// // // //             await page.close();
+
+// // // //             if (img == null) {
+// // // //               throw Exception("Failed to render PDF page");
+// // // //             }
+
+// // // //             return img; // now it's PdfPageImage (non-null)
+// // // //           }),
+
+// // // //           builder: (context, snapshot) {
+// // // //             if (!snapshot.hasData) {
+// // // //               return const Center(child: CircularProgressIndicator());
+// // // //             }
+// // // //             return SizedBox(
+// // // //               width: pageSize.width,
+// // // //               height: pageSize.height,
+// // // //               child: Image.memory(snapshot.data!.bytes, fit: BoxFit.contain),
+// // // //             );
+// // // //           },
+// // // //         );
+// // // //         final clusters = _computeClusters(constraints.biggest);
+// // // //         return GestureDetector(
+// // // //           onTapUp: (d) {
+// // // //             // local (within the stack)
+// // // //             final local = (context.findRenderObject() as RenderBox)
+// // // //                 .globalToLocal(d.globalPosition);
+// // // //             // page-space point
+// // // //             final p = _toPageSpace(local);
+
+// // // //             // ignore taps outside page rect
+// // // //             if (p.dx < 0 ||
+// // // //                 p.dy < 0 ||
+// // // //                 p.dx > pageSize.width ||
+// // // //                 p.dy > pageSize.height)
+// // // //               return;
+
+// // // //             widget.onAddMarker(
+// // // //               MarkerPoint(page: widget.pageNumber, x: p.dx, y: p.dy),
+// // // //             );
+// // // //             setState(() {}); // rep aint overlay
+// // // //           },
+// // // //           child: InteractiveViewer(
+// // // //             minScale: 0.5,
+// // // //             maxScale: 6.0,
+// // // //             transformationController: _controller,
+// // // //             child: Stack(
+// // // //               key: _repaintKey,
+// // // //               children: [
+// // // //                 // Center page
+// // // //                 SizedBox(
+// // // //                   width: math.max(pageSize.width, constraints.maxWidth),
+// // // //                   height: math.max(pageSize.height, constraints.maxHeight),
+// // // //                   child: FittedBox(
+// // // //                     alignment: Alignment.center,
+// // // //                     child: pageWidget,
+// // // //                   ),
+// // // //                 ),
+// // // //                 // Dynamic overlay using CustomPaint
+// // // //                 Positioned.fill(
+// // // //                   child: Positioned.fill(
+// // // //                     child: CustomPaint(
+// // // //                       painter: _OverlayPainter(clusters: clusters),
+// // // //                     ),
+// // // //                   ),
+// // // //                   // CustomPaint(
+// // // //                   //   painter: _OverlayPainter(
+// // // //                   //     markers: widget.markers
+// // // //                   //         .where((m) => m.page == widget.pageNumber)
+// // // //                   //         .toList(),
+// // // //                   //     transform:
+// // // //                   //         _controller.value, // pass InteractiveViewer matrix
+// // // //                   //   ),
+// // // //                   // ),
+// // // //                 ),
+
+                
+// // // //               ],
+// // // //             ),
+// // // //           ),
+// // // //         );
+// // // //       },
+// // // //     );
+// // // //   }
+// // // // }
+
+// // // // /// ---------- Overlay painter: draws clusters/markers on top in screen space
+// // // // class _OverlayPainter extends CustomPainter {
+// // // //   final List<Cluster> clusters;
+
+// // // //   _OverlayPainter({required this.clusters});
+
+// // // //   @override
+// // // //   void paint(Canvas canvas, Size size) {
+// // // //     final fill = Paint()..color = Colors.blue;
+// // // //     final stroke = Paint()
+// // // //       ..color = Colors.blue
+// // // //       ..style = PaintingStyle.stroke
+// // // //       ..strokeWidth = .2;
+
+// // // //     final textStyle = const TextStyle(color: Colors.white, fontSize: 12);
+
+// // // //     for (final c in clusters) {
+// // // //       if (c.members.length == 1) {
+// // // //         // Single marker → small dot
+// // // //         canvas.drawCircle(c.centerScreen, 6, fill);
+// // // //         canvas.drawCircle(c.centerScreen, 6, stroke);
+// // // //       } else {
+// // // //         // Cluster → bigger circle + count text
+// // // //         const r = 12.0;
+// // // //         canvas.drawCircle(c.centerScreen, r, fill);
+// // // //         canvas.drawCircle(c.centerScreen, r, stroke);
+
+// // // //         final tp = TextPainter(
+// // // //           text: TextSpan(text: "${c.members.length}", style: textStyle),
+// // // //           textAlign: TextAlign.center,
+// // // //           textDirection: TextDirection.ltr,
+// // // //         );
+// // // //         tp.layout();
+// // // //         tp.paint(canvas, c.centerScreen - Offset(tp.width / 2, tp.height / 2));
+// // // //       }
+// // // //     }
+// // // //   }
+
+// // // //   @override
+// // // //   bool shouldRepaint(covariant _OverlayPainter oldDelegate) => true;
+// // // // }
+
+
+
+
+// // // // // // ---------- almost done
+
+// // // // // // import 'dart:convert';
+// // // // // // import 'dart:developer';
+// // // // // // import 'dart:typed_data';
+// // // // // // import 'package:flutter/material.dart';
+// // // // // // import 'package:flutter/services.dart';
+// // // // // // import 'package:http/http.dart' as http;
+// // // // // // import 'package:syncfusion_flutter_pdf/pdf.dart';
+// // // // // // import 'package:syncfusion_flutter_pdfviewer/pdfviewer.dart';
+
+// // // // // // /// Marker model
+// // // // // // class Marker {
+// // // // // //   final int page;
+// // // // // //   final Offset position;
+// // // // // //   Marker(this.page, this.position);
+// // // // // // }
+
+// // // // // // /// Cluster model
+// // // // // // class Cluster {
+// // // // // //   final int page;
+// // // // // //   final Offset center;
+// // // // // //   final List<Marker> markers;
+// // // // // //   Cluster(this.page, this.center, this.markers);
+// // // // // // }
+
+// // // // // // void main() => runApp(const MyApp());
+
+// // // // // // class MyApp extends StatelessWidget {
+// // // // // //   const MyApp({super.key});
+
+// // // // // //   @override
+// // // // // //   Widget build(BuildContext context) {
+// // // // // //     return const MaterialApp(
+// // // // // //       debugShowCheckedModeBanner: false,
+// // // // // //       home: PDFClusterDemo(),
+// // // // // //     );
+// // // // // //   }
+// // // // // // }
+
+// // // // // // class PDFClusterDemo extends StatefulWidget {
+// // // // // //   const PDFClusterDemo({super.key});
+
+// // // // // //   @override
+// // // // // //   State<PDFClusterDemo> createState() => _PDFClusterDemoState();
+// // // // // // }
+
+// // // // // // class _PDFClusterDemoState extends State<PDFClusterDemo> {
+// // // // // //   final PdfViewerController _pdfController = PdfViewerController();
+// // // // // //   double _zoom = 1.0;
+// // // // // //   Uint8List _originalPdf = Uint8List(0);
+// // // // // //   Uint8List _clusteredPdf = Uint8List(0);
+// // // // // //   bool _isLoading = true;
+
+// // // // // //   /// Raw markers (always preserved)
+// // // // // //   final List<Marker> _allMarkers = [];
+
+// // // // // //   @override
+// // // // // //   void initState() {
+// // // // // //     super.initState();
+// // // // // //     _loadPdf();
+// // // // // //   }
+
+// // // // // //   void _zoomIn() {
+// // // // // //     final newZoom = (_pdfController.zoomLevel + 0.5).clamp(0.5, 5.0);
+// // // // // //     _pdfController.zoomLevel = newZoom;
+// // // // // //     setState(() {
+// // // // // //       _zoom = newZoom;
+// // // // // //     });
+// // // // // //     _updateClustering(); // Zoom change par clustering update karo
+// // // // // //   }
+
+// // // // // //   void _zoomOut() {
+// // // // // //     final newZoom = (_pdfController.zoomLevel - 0.5).clamp(0.5, 5.0);
+// // // // // //     _pdfController.zoomLevel = newZoom;
+// // // // // //     setState(() {
+// // // // // //       _zoom = newZoom;
+// // // // // //     });
+// // // // // //     _updateClustering(); // Zoom change par clustering update karo
+// // // // // //   }
+
+
+// // // // // //   Future<void> _loadPdf() async {
+// // // // // //     try {
+// // // // // //       // const url =
+// // // // // //       //     "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf";
+// // // // // //       // final res = await http.get(Uri.parse(url));
+// // // // // //        final bytes = await rootBundle.load('assets/PDF.pdf');
+// // // // // //       // if (res.statusCode == 200) {
+// // // // // //         setState(() {
+// // // // // //           _originalPdf = bytes.buffer.asUint8List();
+// // // // // //           _clusteredPdf = bytes.buffer.asUint8List();
+// // // // // //           _isLoading = false;
+// // // // // //         });
+// // // // // //       // }
+// // // // // //     } catch (e) {
+// // // // // //       log("Error loading PDF: $e");
+// // // // // //       setState(() => _isLoading = false);
+// // // // // //     }
+// // // // // //   }
+
+// // // // // //   /// Smart clustering logic based on zoom level
+// // // // // //   List<Cluster> _makeClusters(List<Marker> markers, double zoom) {
+// // // // // //     // Zoom level thresholds for clustering
+// // // // // //     if (_zoom > 3.0) {
+// // // // // //       // Maximum zoom - show all markers individually
+// // // // // //       return markers.map((m) => Cluster(m.page, m.position, [m])).toList();
+// // // // // //     } else if (_zoom > 1.5) {
+// // // // // //       // Medium zoom - cluster only very close markers
+// // // // // //       final threshold = 20 / _zoom;
+// // // // // //       return _createClusters(markers, threshold);
+// // // // // //     } else {
+// // // // // //       // Small zoom - aggressive clustering
+// // // // // //       final threshold = 40 / _zoom;
+// // // // // //       return _createClusters(markers, threshold);
+// // // // // //     }
+// // // // // //   }
+
+// // // // // //   List<Cluster> _createClusters(List<Marker> markers, double threshold) {
+// // // // // //     final List<Cluster> clusters = [];
+// // // // // //     final used = <Marker>{};
+
+// // // // // //     for (final m in markers) {
+// // // // // //       if (used.contains(m)) continue;
+
+// // // // // //       final group = <Marker>[m];
+// // // // // //       for (final other in markers) {
+// // // // // //         if (other == m || used.contains(other)) continue;
+// // // // // //         if ((other.position - m.position).distance <= threshold &&
+// // // // // //             other.page == m.page) {
+// // // // // //           group.add(other);
+// // // // // //         }
+// // // // // //       }
+
+// // // // // //       used.addAll(group);
+
+// // // // // //       if (group.length == 1) {
+// // // // // //         clusters.add(Cluster(m.page, m.position, group));
+// // // // // //       } else {
+// // // // // //         final dx =
+// // // // // //             group.map((e) => e.position.dx).reduce((a, b) => a + b) /
+// // // // // //             group.length;
+// // // // // //         final dy =
+// // // // // //             group.map((e) => e.position.dy).reduce((a, b) => a + b) /
+// // // // // //             group.length;
+// // // // // //         clusters.add(Cluster(m.page, Offset(dx, dy), group));
+// // // // // //       }
+// // // // // //     }
+// // // // // //     return clusters;
+// // // // // //   }
+
+// // // // // //   Uint8List _generateClusteredPdf(List<Marker> allMarkers, double zoom) {
+// // // // // //     if (allMarkers.isEmpty) return _originalPdf;
+
+// // // // // //     final doc = PdfDocument(inputBytes: _originalPdf);
+// // // // // //     final clusters = _makeClusters(allMarkers, zoom);
+
+// // // // // //     for (final cluster in clusters) {
+// // // // // //       // make sure cluster.page is valid (1-based index)
+// // // // // //       if (cluster.page < 1 || cluster.page > doc.pages.count) {
+// // // // // //         debugPrint("⚠️ Skipping invalid page: ${cluster.page}");
+// // // // // //         continue;
+// // // // // //       }
+
+// // // // // //       final page = doc.pages[cluster.page - 1]; // safe now ✅
+
+// // // // // //       if (cluster.markers.length == 1) {
+// // // // // //         // Single marker - Red circle with number
+// // // // // //         final marker = cluster.markers.first;
+// // // // // //         final markerIndex = allMarkers.indexOf(marker) + 1;
+
+// // // // // //         _drawSingleMarker(page, marker, markerIndex);
+// // // // // //       } else {
+// // // // // //         // Cluster - Blue circle with count
+// // // // // //         _drawCluster(page, cluster.center, cluster.markers.length);
+// // // // // //       }
+// // // // // //     }
+
+// // // // // //     final bytes = doc.saveSync();
+// // // // // //     doc.dispose();
+// // // // // //     return Uint8List.fromList(bytes);
+// // // // // //   }
+
+// // // // // //   void _drawSingleMarker(PdfPage page, Marker marker, int index) {
+// // // // // //     // Red background circle
+// // // // // //     page.graphics.drawEllipse(
+// // // // // //       Rect.fromCircle(center: marker.position, radius: 12),
+// // // // // //       brush: PdfSolidBrush(PdfColor(220, 0, 0)),
+// // // // // //     );
+
+// // // // // //     // White border
+// // // // // //     page.graphics.drawEllipse(
+// // // // // //       Rect.fromCircle(center: marker.position, radius: 12),
+// // // // // //       pen: PdfPen(PdfColor(255, 255, 255), width: 2),
+// // // // // //     );
+
+// // // // // //     // White number
+// // // // // //     page.graphics.drawString(
+// // // // // //       index.toString(),
+// // // // // //       PdfStandardFont(PdfFontFamily.helvetica, 10),
+// // // // // //       bounds: Rect.fromCenter(center: marker.position, width: 20, height: 20),
+// // // // // //       brush: PdfSolidBrush(PdfColor(255, 255, 255)),
+// // // // // //       format: PdfStringFormat(
+// // // // // //         alignment: PdfTextAlignment.center,
+// // // // // //         lineAlignment: PdfVerticalAlignment.middle,
+// // // // // //       ),
+// // // // // //     );
+// // // // // //   }
+
+// // // // // //   void _drawCluster(PdfPage page, Offset center, int count) {
+// // // // // //     // Blue background circle
+// // // // // //     page.graphics.drawEllipse(
+// // // // // //       Rect.fromCircle(center: center, radius: 16),
+// // // // // //       brush: PdfSolidBrush(PdfColor(0, 0, 220)),
+// // // // // //     );
+
+// // // // // //     // White border
+// // // // // //     page.graphics.drawEllipse(
+// // // // // //       Rect.fromCircle(center: center, radius: 16),
+// // // // // //       pen: PdfPen(PdfColor(255, 255, 255), width: 2),
+// // // // // //     );
+
+// // // // // //     // White count
+// // // // // //     page.graphics.drawString(
+// // // // // //       count.toString(),
+// // // // // //       PdfStandardFont(PdfFontFamily.helvetica, 12),
+// // // // // //       bounds: Rect.fromCenter(center: center, width: 24, height: 24),
+// // // // // //       brush: PdfSolidBrush(PdfColor(255, 255, 255)),
+// // // // // //       format: PdfStringFormat(
+// // // // // //         alignment: PdfTextAlignment.center,
+// // // // // //         lineAlignment: PdfVerticalAlignment.middle,
+// // // // // //       ),
+// // // // // //     );
+// // // // // //   }
+
+// // // // // //   void _updateClustering() {
+// // // // // //     final newPdf = _generateClusteredPdf(_allMarkers, _zoom);
+// // // // // //     setState(() => _clusteredPdf = newPdf);
+// // // // // //   }
+
+// // // // // //   Future<void> _addMarker(Offset pdfPos, int pageNum) async {
+// // // // // //     setState(() {
+// // // // // //       _allMarkers.add(Marker(pageNum, pdfPos));
+// // // // // //       _updateClustering();
+// // // // // //     });
+// // // // // //   }
+
+// // // // // //   void _clearAllMarkers() {
+// // // // // //     setState(() {
+// // // // // //       _allMarkers.clear();
+// // // // // //       _clusteredPdf = _originalPdf;
+// // // // // //     });
+// // // // // //   }
+
+// // // // // //   @override
+// // // // // //   Widget build(BuildContext context) {
+// // // // // //     return Scaffold(
+// // // // // //       appBar: AppBar(
+// // // // // //         title: const Text("PDF Marker Clustering"),
+// // // // // //         backgroundColor: Colors.blue[700],
+// // // // // //         actions: [
+// // // // // //           // Statistics
+// // // // // //           Padding(
+// // // // // //             padding: const EdgeInsets.symmetric(vertical: 14.0),
+// // // // // //             child: Row(
+// // // // // //               children: [
+// // // // // //                 Text(
+// // // // // //                   '${_allMarkers.length} markers',
+// // // // // //                   style: TextStyle(
+// // // // // //                     fontWeight: FontWeight.bold,
+// // // // // //                     color: Colors.white,
+// // // // // //                   ),
+// // // // // //                 ),
+// // // // // //                 SizedBox(width: 16),
+// // // // // //                 Text(
+// // // // // //                   '${_zoom.toStringAsFixed(1)}x',
+// // // // // //                   style: TextStyle(
+// // // // // //                     fontWeight: FontWeight.bold,
+// // // // // //                     color: Colors.white,
+// // // // // //                   ),
+// // // // // //                 ),
+// // // // // //                 SizedBox(width: 8),
+// // // // // //               ],
+// // // // // //             ),
+// // // // // //           ),
+
+// // // // // //           IconButton(
+// // // // // //             icon: Icon(Icons.refresh, color: Colors.white),
+// // // // // //             onPressed: _updateClustering,
+// // // // // //             tooltip: "Refresh Clustering",
+// // // // // //           ),
+// // // // // //           IconButton(
+// // // // // //             icon: Icon(Icons.clear, color: Colors.white),
+// // // // // //             onPressed: _allMarkers.isEmpty ? null : _clearAllMarkers,
+// // // // // //             tooltip: "Clear All Markers",
+// // // // // //           ),
+// // // // // //         ],
+// // // // // //       ),
+// // // // // //       body: _isLoading
+// // // // // //           ? Center(child: CircularProgressIndicator())
+           
+// // // // // //           : SfPdfViewer.memory(
+// // // // // //               _clusteredPdf,
+// // // // // //               controller: _pdfController,
+// // // // // //                maxZoomLevel: 5.0, 
+              
+// // // // // //               onZoomLevelChanged: (details) {
+// // // // // //                 setState(() {
+// // // // // //                   _zoom = details.newZoomLevel;
+// // // // // //                   // _updateClustering();
+// // // // // //                 });
+// // // // // //               },
+// // // // // //               onTap: (details) async {
+// // // // // //                 await _addMarker(details.pagePosition, details.pageNumber);
+// // // // // //                 setState(() {
+// // // // // //                    _updateClustering();
+// // // // // //                 });
+// // // // // //               },
+// // // // // //               pageLayoutMode: PdfPageLayoutMode.single,
+// // // // // //               interactionMode: PdfInteractionMode.pan,
+// // // // // //               canShowScrollHead: true,
+// // // // // //               canShowScrollStatus: true,
+// // // // // //             ),
+
+// // // // // //       // Floating action button for quick actions
+// // // // // //       floatingActionButton: Column(
+// // // // // //         mainAxisSize: MainAxisSize.min,
+// // // // // //         children: [
+// // // // // //           FloatingActionButton(
+// // // // // //             mini: true,
+// // // // // //             child: const Icon(Icons.add),
+// // // // // //             onPressed: () {
+// // // // // //               _zoomIn();
+// // // // // //             },
+// // // // // //           ),
+// // // // // //           const SizedBox(height: 8),
+// // // // // //           FloatingActionButton(
+// // // // // //             mini: true,
+// // // // // //             child: const Icon(Icons.remove),
+// // // // // //             onPressed: () {
+// // // // // //               _zoomOut();
+// // // // // //             },
+// // // // // //           ),
+// // // // // //         ],
+// // // // // //       ),
+// // // // // //     );
+// // // // // //   }
+// // // // // // }
+
+
+// // // // // // -----------------------------------------
+
+// // // // // //  zoom 10 pr muiltples markers with numbers
+// // // // // // import 'dart:typed_data';
+// // // // // // import 'dart:developer';
+// // // // // // import 'package:flutter/material.dart';
+// // // // // // import 'package:flutter/services.dart';
+// // // // // // import 'package:syncfusion_flutter_pdfviewer/pdfviewer.dart';
+// // // // // // import 'package:syncfusion_flutter_pdf/pdf.dart';
+// // // // // // import 'package:flutter/foundation.dart';
+
+// // // // // // class MarkerParams {
+// // // // // //   final Uint8List bytes;
+// // // // // //   final Offset point;
+// // // // // //   final int page;
+// // // // // //   final int number;
+
+// // // // // //   MarkerParams(this.bytes, this.point, this.page, this.number);
+// // // // // // }
+
+// // // // // // void main() {
+// // // // // //   runApp(const MyApp());
+// // // // // // }
+
+// // // // // // class MyApp extends StatelessWidget {
+// // // // // //   const MyApp({super.key});
+// // // // // //   @override
+// // // // // //   Widget build(BuildContext context) {
+// // // // // //     return MaterialApp(
+// // // // // //       debugShowCheckedModeBanner: false,
+// // // // // //       title: 'PDF Marker Demo',
+// // // // // //       theme: ThemeData(primarySwatch: Colors.blue),
+// // // // // //       home: const PDFMarkerScreen(),
+// // // // // //     );
+// // // // // //   }
+// // // // // // }
+
+// // // // // // class PDFMarkerScreen extends StatefulWidget {
+// // // // // //   const PDFMarkerScreen({super.key});
+// // // // // //   @override
+// // // // // //   State<PDFMarkerScreen> createState() => _PDFMarkerScreenState();
+// // // // // // }
+
+// // // // // // class _PDFMarkerScreenState extends State<PDFMarkerScreen> {
+// // // // // //   final PdfViewerController _pdfController = PdfViewerController();
+// // // // // //   Uint8List _pdfBytes = Uint8List(0);
+// // // // // //   double _currentZoom = 1.0;
+// // // // // //   int _markerCounter = 1;
+
+// // // // // //   @override
+// // // // // //   void initState() {
+// // // // // //     super.initState();
+// // // // // //     _loadLocalPdf();
+// // // // // //   }
+
+// // // // // //   Future<void> _loadLocalPdf() async {
+// // // // // //     final bytes = await rootBundle.load('assets/PDF.pdf');
+// // // // // //     setState(() {
+// // // // // //       _pdfBytes = bytes.buffer.asUint8List();
+// // // // // //     });
+// // // // // //   }
+
+// // // // // //   static Uint8List processPdfWithMarker(MarkerParams params) {
+// // // // // //     final document = PdfDocument(inputBytes: params.bytes);
+// // // // // //     final page = document.pages[params.page];
+
+// // // // // //     // Draw red circle
+// // // // // //     page.graphics.drawEllipse(
+// // // // // //       Rect.fromCircle(center: params.point, radius: 12),
+// // // // // //       pen: PdfPen(PdfColor(255, 0, 0), width: 2),
+// // // // // //       brush: PdfSolidBrush(PdfColor(255, 0, 0)),
+// // // // // //     );
+
+// // // // // //     // Draw white number
+// // // // // //     page.graphics.drawString(
+// // // // // //       params.number.toString(),
+// // // // // //       PdfStandardFont(PdfFontFamily.helvetica, 18),
+// // // // // //       bounds: Rect.fromCenter(center: params.point, width: 24, height: 24),
+// // // // // //       brush: PdfSolidBrush(PdfColor(255, 255, 255)),
+// // // // // //       format: PdfStringFormat(
+// // // // // //         alignment: PdfTextAlignment.center,
+// // // // // //         lineAlignment: PdfVerticalAlignment.middle,
+// // // // // //       ),
+// // // // // //     );
+
+// // // // // //     final newBytes = document.saveSync();
+// // // // // //     document.dispose();
+// // // // // //     return Uint8List.fromList(newBytes);
+// // // // // //   }
+
+// // // // // //   Future<void> _addMarker(Offset pdfPoint, int pageNumber) async {
+// // // // // //     if (_pdfBytes.isEmpty) return;
+
+// // // // // //     final newBytes = await compute(
+// // // // // //       processPdfWithMarker,
+// // // // // //       MarkerParams(_pdfBytes, pdfPoint, pageNumber - 1, _markerCounter),
+// // // // // //     );
+
+// // // // // //     setState(() {
+// // // // // //       _pdfBytes = newBytes;
+// // // // // //       _markerCounter++;
+// // // // // //     });
+// // // // // //   }
+
+// // // // // //   @override
+// // // // // //   Widget build(BuildContext context) {
+// // // // // //     return Scaffold(
+// // // // // //       appBar: AppBar(title: const Text("PDF Marker Demo")),
+// // // // // //       body: _pdfBytes.isEmpty
+// // // // // //           ? const Center(child: CircularProgressIndicator())
+// // // // // //           : SfPdfViewer.memory(
+// // // // // //             maxZoomLevel: 10,
+// // // // // //               _pdfBytes,
+// // // // // //               controller: _pdfController,
+// // // // // //               onZoomLevelChanged: (details) {
+// // // // // //                 setState(() => _currentZoom = details.newZoomLevel);
+// // // // // //               },
+// // // // // //               onTap: (details) {
+// // // // // //                 _addMarker(details.pagePosition, details.pageNumber);
+// // // // // //               },
+// // // // // //             ),
+// // // // // //       floatingActionButton: Column(
+// // // // // //         mainAxisSize: MainAxisSize.min,
+// // // // // //         children: [
+// // // // // //           FloatingActionButton(
+// // // // // //             mini: true,
+// // // // // //             child: const Icon(Icons.add),
+// // // // // //             onPressed: () {
+// // // // // //               setState(() {
+// // // // // //                 _pdfController.zoomLevel += 0.5;
+// // // // // //                 _currentZoom = _pdfController.zoomLevel;
+// // // // // //               });
+// // // // // //             },
+// // // // // //           ),
+// // // // // //           const SizedBox(height: 8),
+// // // // // //           FloatingActionButton(
+// // // // // //             mini: true,
+// // // // // //             child: const Icon(Icons.remove),
+// // // // // //             onPressed: () {
+// // // // // //               setState(() {
+// // // // // //                 _pdfController.zoomLevel -= 0.5;
+// // // // // //                 _currentZoom = _pdfController.zoomLevel;
+// // // // // //               });
+// // // // // //             },
+// // // // // //           ),
+// // // // // //         ],
+// // // // // //       ),
+// // // // // //     );
+// // // // // //   }
+// // // // // // }
+
+// // // // // // ----------
+
+// // // // // // import 'dart:developer';
+// // // // // // import 'dart:typed_data';
+// // // // // // import 'package:flutter/material.dart';
+// // // // // // import 'package:http/http.dart' as http;
+// // // // // // import 'package:syncfusion_flutter_pdf/pdf.dart';
+// // // // // // import 'package:syncfusion_flutter_pdfviewer/pdfviewer.dart';
+
+// // // // // // /// Marker model
+// // // // // // class Marker {
+// // // // // //   final int page;
+// // // // // //   final Offset position;
+// // // // // //   Marker(this.page, this.position);
+// // // // // // }
+
+// // // // // // /// Cluster model
+// // // // // // class Cluster {
+// // // // // //   final int page;
+// // // // // //   final Offset center;
+// // // // // //   final List<Marker> markers;
+// // // // // //   Cluster(this.page, this.center, this.markers);
+// // // // // // }
+
+// // // // // // void main() => runApp(const MyApp());
+
+// // // // // // class MyApp extends StatelessWidget {
+// // // // // //   const MyApp({super.key});
+
+// // // // // //   @override
+// // // // // //   Widget build(BuildContext context) {
+// // // // // //     return const MaterialApp(
+// // // // // //       debugShowCheckedModeBanner: false,
+// // // // // //       home: PDFClusterDemo(),
+// // // // // //     );
+// // // // // //   }
+// // // // // // }
+
+// // // // // // class PDFClusterDemo extends StatefulWidget {
+// // // // // //   const PDFClusterDemo({super.key});
+
+// // // // // //   @override
+// // // // // //   State<PDFClusterDemo> createState() => _PDFClusterDemoState();
+// // // // // // }
+
+// // // // // // class _PDFClusterDemoState extends State<PDFClusterDemo> {
+// // // // // //   final PdfViewerController _pdfController = PdfViewerController();
+// // // // // //   double _zoom = 1.0;
+// // // // // //   Uint8List _originalPdf = Uint8List(0);
+// // // // // //   Uint8List _renderedPdf = Uint8List(0);
+
+// // // // // //   /// Raw markers (always preserved)
+// // // // // //   final List<Marker> _allMarkers = [];
+
+// // // // // //   @override
+// // // // // //   void initState() {
+// // // // // //     super.initState();
+// // // // // //     _loadPdf();
+// // // // // //   }
+
+// // // // // //   Future<void> _loadPdf() async {
+// // // // // //     const url =
+// // // // // //         "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf";
+// // // // // //     final res = await http.get(Uri.parse(url));
+// // // // // //     if (res.statusCode == 200) {
+// // // // // //       setState(() {
+// // // // // //         _originalPdf = res.bodyBytes;
+// // // // // //         _renderedPdf = res.bodyBytes;
+// // // // // //       });
+// // // // // //     }
+// // // // // //   }
+
+// // // // // //   /// Clustering logic
+// // // // // //   List<Cluster> _makeClusters(List<Marker> markers, double zoom) {
+// // // // // //     const baseThreshold = 30.0; // px distance
+// // // // // //     final threshold = baseThreshold / zoom;
+
+// // // // // //     final List<Cluster> clusters = [];
+// // // // // //     final used = <Marker>{};
+
+// // // // // //     for (final m in markers) {
+// // // // // //       if (used.contains(m)) continue;
+
+// // // // // //       final group = <Marker>[m];
+// // // // // //       for (final other in markers) {
+// // // // // //         if (other == m || used.contains(other)) continue;
+// // // // // //         if ((other.position - m.position).distance <= threshold &&
+// // // // // //             other.page == m.page) {
+// // // // // //           group.add(other);
+// // // // // //         }
+// // // // // //       }
+// // // // // //       for (final g in group) {
+// // // // // //         used.add(g);
+// // // // // //       }
+
+// // // // // //       // Average center
+// // // // // //       final dx =
+// // // // // //           group.map((e) => e.position.dx).reduce((a, b) => a + b) /
+// // // // // //           group.length;
+// // // // // //       final dy =
+// // // // // //           group.map((e) => e.position.dy).reduce((a, b) => a + b) /
+// // // // // //           group.length;
+// // // // // //       clusters.add(Cluster(m.page, Offset(dx, dy), group));
+// // // // // //     }
+// // // // // //     return clusters;
+// // // // // //   }
+
+// // // // // //   /// Generate clustered PDF (always embedded, no overlay)
+// // // // // //   Uint8List _generatePdfWithClusters(
+// // // // // //     Uint8List baseBytes,
+// // // // // //     List<Marker> all,
+// // // // // //     double zoom,
+// // // // // //   ) {
+// // // // // //     final doc = PdfDocument(inputBytes: baseBytes);
+
+// // // // // //     final clusters = _makeClusters(all, zoom);
+
+// // // // // //     for (final c in clusters) {
+// // // // // //       final page = doc.pages[c.page - 1];
+// // // // // //       if (c.markers.length == 1) {
+// // // // // //         // Single marker → draw circle with number
+// // // // // //         final m = c.markers.first;
+// // // // // //         page.graphics.drawEllipse(
+// // // // // //           Rect.fromCircle(center: m.position, radius: 10),
+// // // // // //           pen: PdfPen(PdfColor(255, 0, 0), width: 2),
+// // // // // //           brush: PdfSolidBrush(PdfColor(255, 0, 0)),
+// // // // // //         );
+// // // // // //         page.graphics.drawString(
+// // // // // //           (_allMarkers.indexOf(m) + 1).toString(),
+// // // // // //           PdfStandardFont(PdfFontFamily.helvetica, 12),
+// // // // // //           bounds: Rect.fromCenter(center: m.position, width: 20, height: 20),
+// // // // // //           brush: PdfSolidBrush(PdfColor(255, 255, 255)),
+// // // // // //           format: PdfStringFormat(
+// // // // // //             alignment: PdfTextAlignment.center,
+// // // // // //             lineAlignment: PdfVerticalAlignment.middle,
+// // // // // //           ),
+// // // // // //         );
+// // // // // //       } else {
+// // // // // //         // Cluster → blue circle with count
+// // // // // //         page.graphics.drawEllipse(
+// // // // // //           Rect.fromCircle(center: c.center, radius: 14),
+// // // // // //           pen: PdfPen(PdfColor(0, 0, 255), width: 2),
+// // // // // //           brush: PdfSolidBrush(PdfColor(0, 0, 255)),
+// // // // // //         );
+// // // // // //         page.graphics.drawString(
+// // // // // //           c.markers.length.toString(),
+// // // // // //           PdfStandardFont(PdfFontFamily.helvetica, 12),
+// // // // // //           bounds: Rect.fromCenter(center: c.center, width: 24, height: 24),
+// // // // // //           brush: PdfSolidBrush(PdfColor(255, 255, 255)),
+// // // // // //           format: PdfStringFormat(
+// // // // // //             alignment: PdfTextAlignment.center,
+// // // // // //             lineAlignment: PdfVerticalAlignment.middle,
+// // // // // //           ),
+// // // // // //         );
+// // // // // //       }
+// // // // // //     }
+
+// // // // // //     final bytes = doc.saveSync();
+// // // // // //     doc.dispose();
+// // // // // //     return Uint8List.fromList(bytes);
+// // // // // //   }
+
+// // // // // //   void _refreshPdf() {
+// // // // // //     final newBytes = _generatePdfWithClusters(_originalPdf, _allMarkers, _zoom);
+// // // // // //     setState(() {
+// // // // // //       _renderedPdf = newBytes;
+// // // // // //     });
+// // // // // //   }
+
+// // // // // //   void _addMarker(Offset pdfPos, int pageNum) {
+// // // // // //     _allMarkers.add(Marker(pageNum, pdfPos));
+// // // // // //     _refreshPdf();
+// // // // // //   }
+
+// // // // // //   /// Final save with all markers individually
+// // // // // //   Uint8List _exportFinalPdf() {
+// // // // // //     final doc = PdfDocument(inputBytes: _originalPdf);
+// // // // // //     for (var i = 0; i < _allMarkers.length; i++) {
+// // // // // //       final m = _allMarkers[i];
+// // // // // //       final page = doc.pages[m.page - 1];
+// // // // // //       page.graphics.drawEllipse(
+// // // // // //         Rect.fromCircle(center: m.position, radius: 10),
+// // // // // //         pen: PdfPen(PdfColor(200, 0, 0), width: 2),
+// // // // // //         brush: PdfSolidBrush(PdfColor(200, 0, 0)),
+// // // // // //       );
+// // // // // //       page.graphics.drawString(
+// // // // // //         (i + 1).toString(),
+// // // // // //         PdfStandardFont(PdfFontFamily.helvetica, 12),
+// // // // // //         bounds: Rect.fromCenter(center: m.position, width: 20, height: 20),
+// // // // // //         brush: PdfSolidBrush(PdfColor(255, 255, 255)),
+// // // // // //         format: PdfStringFormat(
+// // // // // //           alignment: PdfTextAlignment.center,
+// // // // // //           lineAlignment: PdfVerticalAlignment.middle,
+// // // // // //         ),
+// // // // // //       );
+// // // // // //     }
+// // // // // //     final bytes = doc.saveSync();
+// // // // // //     doc.dispose();
+// // // // // //     return Uint8List.fromList(bytes);
+// // // // // //   }
+
+// // // // // //   @override
+// // // // // //   Widget build(BuildContext context) {
+// // // // // //     return Scaffold(
+// // // // // //       appBar: AppBar(
+// // // // // //         title: const Text("Clustered PDF Markers"),
+// // // // // //         actions: [
+// // // // // //           IconButton(
+// // // // // //             icon: const Icon(Icons.save),
+// // // // // //             onPressed: () {
+// // // // // //               final finalBytes = _exportFinalPdf();
+// // // // // //               log("✅ Final PDF saved with ${_allMarkers.length} markers");
+// // // // // //             },
+// // // // // //           ),
+// // // // // //         ],
+// // // // // //       ),
+// // // // // //       body: _renderedPdf.isEmpty
+// // // // // //           ? const Center(child: CircularProgressIndicator())
+// // // // // //           : SfPdfViewer.memory(
+// // // // // //               _renderedPdf,
+// // // // // //               controller: _pdfController,
+// // // // // //               onZoomLevelChanged: (details) {
+// // // // // //                 setState(() => _zoom = details.newZoomLevel);
+// // // // // //               },
+// // // // // //               onTap: (details) {
+// // // // // //                 _addMarker(details.pagePosition, details.pageNumber);
+// // // // // //               },
+// // // // // //             ),
+// // // // // //     );
+// // // // // //   }
+// // // // // // }
+
+// // // // // // // ------- pdf tron -----
+// // // // // // import 'dart:developer';
+// // // // // // import 'dart:io';
+// // // // // // import 'package:flutter/material.dart';
+// // // // // // import 'package:pdftron_flutter/pdftron_flutter.dart';
+// // // // // // import 'package:http/http.dart' as http;
+// // // // // // import 'package:path_provider/path_provider.dart';
+
+// // // // // // Future<void> main() async {
+// // // // // //   WidgetsFlutterBinding.ensureInitialized();
+
+// // // // // //   // initialize Pdftron
+// // // // // //   await PdftronFlutter.initialize('');
+
+// // // // // //   runApp(const MyApp());
+// // // // // // }
+
+// // // // // // class MyApp extends StatelessWidget {
+// // // // // //   const MyApp({super.key});
+
+// // // // // //   @override
+// // // // // //   Widget build(BuildContext context) {
+// // // // // //     return const MaterialApp(home: PdfViewerScreen());
+// // // // // //   }
+// // // // // // }
+
+// // // // // // class PdfViewerScreen extends StatefulWidget {
+// // // // // //   const PdfViewerScreen({super.key});
+
+// // // // // //   @override
+// // // // // //   State<PdfViewerScreen> createState() => _PdfViewerScreenState();
+// // // // // // }
+
+// // // // // // class _PdfViewerScreenState extends State<PdfViewerScreen> {
+// // // // // //   bool _loading = true;
+
+// // // // // //   @override
+// // // // // //   void initState() {
+// // // // // //     super.initState();
+// // // // // //     _loadPdf();
+// // // // // //   }
+
+// // // // // //   Future<void> _loadPdf() async {
+// // // // // //     try {
+// // // // // //       // 🔽 Step 1: Download file
+// // // // // //       final url =
+// // // // // //           "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf";
+// // // // // //       final response = await http.get(Uri.parse(url));
+
+// // // // // //       if (response.statusCode == 200) {
+// // // // // //         // 🔽 Step 2: Save to temp dir
+// // // // // //         final dir = await getTemporaryDirectory();
+// // // // // //         final file = File("${dir.path}/sample.pdf");
+// // // // // //         await file.writeAsBytes(response.bodyBytes);
+
+// // // // // //         // 🔽 Step 3: Open with Pdftron
+// // // // // //         // await PdftronFlutter.openDocument(file.path);
+// // // // // //         await PdftronFlutter.openDocument(
+// // // // // //           file.path,
+// // // // // //           config: Config()
+// // // // // //             ..disabledElements = [
+// // // // // //               "toolsButton",
+// // // // // //               "searchButton",
+// // // // // //               "shareButton",
+// // // // // //               "viewControlsButton",
+// // // // // //               "thumbnailsButton",
+// // // // // //               "listsButton",
+// // // // // //               "editPagesButton",
+// // // // // //               "moreItemsButton",
+// // // // // //             ]
+// // // // // //             ..disabledTools = [
+// // // // // //               "annotationCreateTextHighlight",
+// // // // // //               "stickyTool",
+// // // // // //               "eraserTool",
+// // // // // //             ]
+// // // // // //             ..hideTopToolbars = true
+// // // // // //             ..hideBottomToolbar = true
+// // // // // //             ..multiTabEnabled = false,
+// // // // // //         );
+// // // // // //       } else {
+// // // // // //         log("Download failed: ${response.statusCode}");
+// // // // // //       }
+// // // // // //     } catch (e) {
+// // // // // //       log("Error loading PDF: $e");
+// // // // // //     } finally {
+// // // // // //       setState(() => _loading = false);
+// // // // // //     }
+// // // // // //   }
+
+// // // // // //     Future<void> _addCircleAtTap(Offset localPosition) async {
+// // // // // //     // ⚠️ Yeh coordinate screen ka hai, PDF page coordinate nahi
+// // // // // //     // Demo ke liye fixed rect use kar rahe hain
+// // // // // //     String circleAnnot = """
+// // // // // //     <xfdf xmlns="http://ns.adobe.com/xfdf/" xml:space="preserve">
+// // // // // //       <annots>
+// // // // // //         <circle page="1" rect="100,100,200,200" interior-color="#FF0000" color="#FF0000"/>
+// // // // // //       </annots>
+// // // // // //     </xfdf>
+// // // // // //     """;
+
+// // // // // //     await PdftronFlutter.importAnnotationCommand(circleAnnot);
+// // // // // //   }
+
+// // // // // //   @override
+// // // // // //   Widget build(BuildContext context) {
+// // // // // //     return Scaffold(
+// // // // // //       body: GestureDetector(
+// // // // // //         onTapDown: (details) async {
+// // // // // //           await _addCircleAtTap(details.localPosition);
+// // // // // //         },
+// // // // // //         child: const SizedBox.expand(), // transparent overlay
+// // // // // //       ),
+// // // // // //     );
+// // // // // //   }
+// // // // // // }
